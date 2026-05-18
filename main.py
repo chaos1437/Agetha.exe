@@ -28,7 +28,6 @@ import sys
 BASE_DIR = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
 ASSETS      = BASE_DIR / "assets"
 FONT_PATH   = BASE_DIR / "barrio.ttf"
-PROMPT_FILE = BASE_DIR / "prompt.txt"
 
 WINDOW_W = 340
 WINDOW_H = 510
@@ -281,6 +280,19 @@ class SubtitleRenderer:
         preview = " ".join(texts).strip() or "…"
         self._canvas.after(0, lambda p=preview: self._draw(p, color="#555566"))
 
+    def show_message(self, text: str, color: str = "#ffffff", duration: float = 6.0):
+        """Immediately show a static subtitle message (optionally auto-clears)."""
+        # Interrupt any running typewriter speak
+        self.stop()
+        # Draw immediately on the canvas
+        self._canvas.after(0, lambda: self._draw(text, color))
+        # Schedule clear after duration seconds (if > 0)
+        try:
+            if duration and duration > 0:
+                self._canvas.after(int(duration * 1000), self.clear)
+        except Exception:
+            pass
+
     def speak(self, segments: list, on_done=None):
         self.stop()
         self._stop_event.clear()
@@ -474,7 +486,7 @@ class CompanionApp:
 
         self._bleep  = BleepPlayer()
         self._screen = ScreenReader()
-        self._ai     = AIEngine(prompt_file=PROMPT_FILE)
+        self._ai     = AIEngine()
         self._last_screen_text: str = ""
 
         self._build_ui()
@@ -492,13 +504,10 @@ class CompanionApp:
 
         status_frame = tk.Frame(self.root, bg="#0a0a0f")
         status_frame.pack(fill="x", padx=10)
-        self._dot = tk.Label(status_frame, text="●", fg="#555566",
-                             bg="#0a0a0f", font=("Courier", 10))
-        self._dot.pack(side="left")
         self._status_var = tk.StringVar(value="zzz…")
         tk.Label(status_frame, textvariable=self._status_var,
-                 fg="#555566", bg="#0a0a0f",
-                 font=("Courier", 10)).pack(side="left", padx=4)
+             fg="#555566", bg="#0a0a0f",
+             font=("Courier", 10)).pack(side="left", padx=4)
 
         self._sub_canvas = tk.Canvas(self.root, width=WINDOW_W, height=110,
                                      bg="#0a0a0f", bd=0, highlightthickness=0)
@@ -509,10 +518,19 @@ class CompanionApp:
         input_frame.pack(fill="x", padx=10, pady=(0, 8))
 
         self._input_var = tk.StringVar()
+        # Prefer Barrio font if available (registered earlier), fall back to Courier
+        families = tkfont.families()
+        if "Barrio" in families:
+            input_font = tkfont.Font(family="Barrio", size=11)
+            btn_font = tkfont.Font(family="Barrio", size=12, weight="bold")
+        else:
+            input_font = tkfont.Font(family="Courier", size=11)
+            btn_font = tkfont.Font(family="Courier", size=12, weight="bold")
+
         self._input_box = tk.Entry(
             input_frame,
             textvariable=self._input_var,
-            font=("Courier", 11),
+            font=input_font,
             bg="#1a1a2e", fg="#ccccdd",
             insertbackground="#ccccdd",
             relief="flat", bd=4,
@@ -522,7 +540,7 @@ class CompanionApp:
 
         self._send_btn = tk.Button(
             input_frame, text="→",
-            font=("Courier", 12, "bold"),
+            font=btn_font,
             bg="#223344", fg="#88bbdd",
             activebackground="#334455", activeforeground="#ffffff",
             relief="flat", bd=0, padx=8,
@@ -591,19 +609,12 @@ class CompanionApp:
 
     def _set_state(self, state: str, mood: str = "neutral"):
         self._state = state
-        dot_colors = {
-            self.STATE_SLEEPING: "#334455",
-            self.STATE_THINKING: "#aa8833",
-            self.STATE_IDLE:     "#334433",
-            self.STATE_TALKING:  "#44aa66",
-        }
         labels = {
             self.STATE_SLEEPING: "",
             self.STATE_THINKING: "",
             self.STATE_IDLE:     "",
             self.STATE_TALKING:  "",
         }
-        self._dot.config(fg=dot_colors.get(state, "#555566"))
         self._status_var.set(labels.get(state, state))
 
         self._stop_talking_rotation()
@@ -685,6 +696,13 @@ class CompanionApp:
         segments = response.get("segments", [])
         popup_msgs = response.get("popup", None)
         shutdown_requested = bool(response.get("shutdown", False))
+
+        # Show Groq keys exhausted message in red subtitle area
+        if response.get("groq_exhausted"):
+            self.root.after(0, lambda: self._subtitle.show_message("You reached your limit with your Groq keys", "#ff4444"))
+            self.root.after(0, lambda: self._set_state(self.STATE_IDLE))
+            self._reschedule_screen_poll()
+            return
 
         def _speak_and_continue(resp_segments, resp_mood, resp_shutdown):
             if resp_segments:
@@ -1044,25 +1062,22 @@ def _early_config_check():
     if config_path.exists():
         return  # Nothing to do
 
-    default_config = """# Agetha configuration file
-# Values are case-insensitive. Use yes/no, true/false, 1/0.
-# On first run this file will be created and the program will exit.
-
+    default_config = """# Agetha config file, set "USE_LOCAL_AI" to yes to enable local AI only
+USE_LOCAL_AI = no
 ENABLE_GROQ = yes
 GROQ_API_KEY = 
 GROQ_API_KEY_2 = 
 GROQ_API_KEY_3 = 
 GROQ_API_KEY_4 = 
-
-# Groq model to use.
-# Default: llama-3.3-70b-versatile
-# Use qwen/qwen3-32b for more messages (higher rate limits).
+GROQ_API_KEY_5 = 
+GROQ_API_KEY_6 = 
+GROQ_API_KEY_7 = 
+GROQ_API_KEY_8 = 
+GROQ_API_KEY_9 = 
+GROQ_API_KEY_10 = 
 GROQ_MODEL = llama-3.3-70b-versatile
-
-ENABLE_GEMINI = yes
-GEMINI_API_KEY = 
-GEMINI_MODELS = models/gemini-2.5-flash,models/gemini-2.0-flash,models/gemini-1.5-flash,models/gemini-1.5-flash-002
-
+LOCAL_AI_MODEL = 
+LOCAL_AI_TIMEOUT = 30
 ENABLE_COMMAND_EXECUTION = yes
 """
     config_path.parent.mkdir(parents=True, exist_ok=True)
