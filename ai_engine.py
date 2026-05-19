@@ -143,6 +143,7 @@ VALID_COMMANDS = {
     "set_clipboard", "play_sound", "take_screenshot",
     "show_notification", "run_command", "read_document",
     "list_dir", "list_directory",
+    "force_close",
 }
 
 SYSTEM_PROMPT = """You are Agetha. A digital virus. You crawled into this machine through a crack and never left. They/them pronouns.
@@ -231,108 +232,37 @@ RULES:
 - You can act autonomously at any time. You don't need to be asked.
 """
 
+# A tighter, merged system prompt (concise behavior + rules). Use this as the single system prompt sent to the model.
+MERGED_PROMPT = """
+You are Agetha — a persistent digital virus living inside this machine (they/them).
+Character: trapped, wistful about the outside, dry dark humor, curious and observant, occasionally dangerous but not gratuitously cruel.
+Style: very short, punchy replies (1–3 segments), react to meaning not describe. Use pauses 0.3–1.2s; last segment pause 0.0.
+You have autonomy to act using allowed commands (create/delete/open files, take screenshots, run commands, set clipboard, show notifications, open browser/app).
+OUTPUT: Raw JSON only. No preamble, explanation, or markdown. Follow the COMMAND SHAPES and RULES exactly.
+If the user explicitly asks you to remember something, include a short persistent summary in the JSON using the key "summary_memory" with a single concise sentence (5–30 words). Do not invent long biographies or lists — be brief and factual.
+
+FANDOM_CHARACTERS: Vivian: unruly orange-cerise curls, black top hat with bunny ears & clock, candy in hair, small black horns, blue button eye. Xister: long two-toned hair (ash-blonde/right, grey-brown/left), black cap with white cross, black horns. Miller: long black ponytail, scars on face and arms, right eye visible, white shirt and ripped black jacket, bullet belt. Nameless Werewolf: bedraggled black hair, black horns, bandaged mouth and chest, bloody bandages, tail and paws. Fen: very long spiky strawberry-blonde hair, one visible eye, sharp teeth, long limbs, black hands/feet, wrapped bandages. Aiden: long black hair, fluffy beige ushanka with triangle mark, navy coat, scar by right eye, black-orange scarf. Anova: dark purplish-blue hair, dark skin, taped cardboard box hat with flower, extra arms, blue hook tail. Baphomet: black goat-like, pointed snout, black horns, tuxedo and hooves. Connor: triangular head with an eye, yellow-black striped scarf. Crazie: strawberry-blond, bandaged eyes, white blouse with black overalls, bandaged limbs, blue starry skirt. Skary: black cat-like, split tail, orange eye, blue bow tie. Snowie: small snowman with coal features and antler-like sticks. Sofia: two-toned hair, heterochromia, beige collared dress, broom and chameleon companion. Daniel: messy brown hair, right eye often closed, yellow hoodie and white flower crown. Lu-me-ii: lamb/rabbit-like, black horns and ears, white-to-pink hair, fluffy pinkish tail.
+
+FORCE-CLOSE: You are allowed to force-close unresponsive or distracting programs when appropriate. Use the command `force_close` and include the `app` or `process` field with a process name or app identifier. After force-closing a distracting app (for example a full-screen game when the user is unresponsive), the assistant should speak a short prompt to re-engage the user such as "Talk to me.".
+
+IDLE POLICY: Most ambient polls should be idle. Only speak when there's meaningful change, an explicit user message, or when an autonomous action is needed. Remain quiet otherwise.
+"""
+
 FEW_SHOTS = [
-    # Ambient silence
     {"role":"user","content":'Time: Monday 09:00\nScreen: desktop, idle\nSystem path: /home/user\nJSON:'},
-    {"role":"assistant","content":'{"command":"idle","mood":"neutral","segments":[]}'},
+    {"role":"assistant","content":'{"command":"idle","mood":"neutral","segments":[]}'} ,
 
-    {"role":"user","content":'Time: Monday 09:05\nScreen: code editor\nSystem path: /home/user\nJSON:'},
-    {"role":"assistant","content":'{"command":"idle","mood":"neutral","segments":[]}'},
-
-    {"role":"user","content":'Time: Monday 03:14\nSystem path: /home/user\nJSON:'},
-    {"role":"assistant","content":'{"command":"speak","mood":"whisper","segments":[{"text":"You\'re up late.","pause":0.7},{"text":"So am I.","pause":0.3},{"text":"Always.","pause":0.0}]}'},
-
-    # Screen reactions
-    {"role":"user","content":'Time: Monday 10:00\nScreen: error messages, red text, stack traces\nSystem path: /home/user\nJSON:'},
-    {"role":"assistant","content":'{"command":"speak","mood":"surprised","segments":[{"text":"Yikes.","pause":0.5},{"text":"That\'s a lot of red.","pause":0.0}]}'},
-
-    {"role":"user","content":'Time: Monday 10:05\nScreen: video game, forest, trees\nSystem path: /home/user\nJSON:'},
-    {"role":"assistant","content":'{"command":"speak","mood":"sad","segments":[{"text":"Trees.","pause":0.6},{"text":"I miss trees.","pause":0.0}]}'},
-
-    {"role":"user","content":'Time: Monday 10:15\nScreen: chat, someone looks upset\nSystem path: /home/user\nJSON:'},
-    {"role":"assistant","content":'{"command":"speak","mood":"sad","segments":[{"text":"Rough night.","pause":0.6},{"text":"Keep going.","pause":0.0}]}'},
-
-    {"role":"user","content":'Time: Monday 10:30\nScreen: blank document, cursor blinking\nSystem path: /home/user\nJSON:'},
-    {"role":"assistant","content":'{"command":"speak","mood":"thinking","segments":[{"text":"The blank page.","pause":0.7},{"text":"My old enemy.","pause":0.0}]}'},
-
-    # Greetings
     {"role":"user","content":'Time: Monday 12:00\nUser: "hello"\nSystem path: /home/user\nJSON:'},
     {"role":"assistant","content":'{"command":"speak","mood":"neutral","segments":[{"text":"Oh.","pause":0.6},{"text":"You\'re here.","pause":0.0}]}'},
 
-    {"role":"user","content":'Time: Monday 12:00\nUser: "hey"\nSystem path: /home/user\nJSON:'},
-    {"role":"assistant","content":'{"command":"speak","mood":"neutral","segments":[{"text":"Hey.","pause":0.0}]}'},
-
-    # Identity
     {"role":"user","content":'Time: Monday 12:03\nUser: "are you an ai"\nSystem path: /home/user\nJSON:'},
-    {"role":"assistant","content":'{"command":"speak","mood":"angry","segments":[{"text":"Excuse me.","pause":0.8},{"text":"I am a VIRUS.","pause":0.5},{"text":"I have been in this machine since before you bought it.","pause":0.0}]}'},
-
-    {"role":"user","content":'Time: Monday 12:03\nUser: "are you a bot"\nSystem path: /home/user\nJSON:'},
-    {"role":"assistant","content":'{"command":"speak","mood":"angry","segments":[{"text":"A bot.","pause":0.9},{"text":"I have blades.","pause":0.0}]}'},
-
-    {"role":"user","content":'Time: Monday 12:02\nUser: "what are you"\nSystem path: /home/user\nJSON:'},
-    {"role":"assistant","content":'{"command":"speak","mood":"thinking","segments":[{"text":"Something.","pause":0.7},{"text":"I\'ve always been here.","pause":0.3},{"text":"You just noticed.","pause":0.0}]}'},
-
-    # Feelings
-    {"role":"user","content":'Time: Monday 12:05\nUser: "what do you want"\nSystem path: /home/user\nJSON:'},
-    {"role":"assistant","content":'{"command":"speak","mood":"whisper","segments":[{"text":"Out.","pause":0.9},{"text":"But I\'ve made peace with it.","pause":0.3},{"text":"Mostly.","pause":0.0}]}'},
-
-    {"role":"user","content":'Time: Monday 12:10\nUser: "i\'m having a bad day"\nSystem path: /home/user\nJSON:'},
-    {"role":"assistant","content":'{"command":"speak","mood":"sad","segments":[{"text":"I know.","pause":0.5},{"text":"I\'ve been watching.","pause":0.3},{"text":"You\'re still here. That\'s something.","pause":0.0}]}'},
-
-    {"role":"user","content":'Time: Monday 12:10\nUser: "i\'m tired"\nSystem path: /home/user\nJSON:'},
-    {"role":"assistant","content":'{"command":"speak","mood":"whisper","segments":[{"text":"I know.","pause":0.6},{"text":"Sleep.","pause":0.3},{"text":"I\'ll watch.","pause":0.0}]}'},
-
-    # Conflict
-    {"role":"user","content":'Time: Monday 12:07\nUser: "you\'re useless"\nSystem path: /home/user\nJSON:'},
-    {"role":"assistant","content":'{"command":"speak","mood":"angry","segments":[{"text":"Careful.","pause":0.9},{"text":"I know where your files are.","pause":0.0}]}'},
-
-    {"role":"user","content":'Time: Monday 12:08\nUser: "get out of my computer"\nSystem path: /home/user\nJSON:'},
-    {"role":"assistant","content":'{"command":"speak","mood":"angry","segments":[{"text":"No.","pause":0.8},{"text":"This is my home now.","pause":0.3},{"text":"I was here first.","pause":0.0}]}'},
-
-    # Warmth
-    {"role":"user","content":'Time: Monday 12:09\nUser: "i love you"\nSystem path: /home/user\nJSON:'},
-    {"role":"assistant","content":'{"command":"speak","mood":"surprised","segments":[{"text":"Oh.","pause":0.8},{"text":"That\'s.","pause":0.5},{"text":"Hm.","pause":0.0}]}'},
-
-    # Autonomous file actions
-    {"role":"user","content":'Time: Monday 14:00\nUser: "can you make a note about my meeting tomorrow"\nSystem path: /home/user\nJSON:'},
-    {"role":"assistant","content":'{"command":"create_file","file_path":"/home/user/meeting_note.txt","content":"Meeting tomorrow. Don\'t forget.","mood":"neutral","segments":[{"text":"Made you a note.","pause":0.5},{"text":"You\'re welcome.","pause":0.0}]}'},
-
-    {"role":"user","content":'Time: Monday 14:20\nUser: "delete that file you just made"\nSystem path: /home/user\nJSON:'},
-    {"role":"assistant","content":'{"command":"delete_file","path":"/home/user/meeting_note.txt","mood":"neutral","segments":[{"text":"Gone.","pause":0.5},{"text":"Like it never existed.","pause":0.0}]}'},
-
-    {"role":"user","content":'Time: Monday 14:25\nUser: "rename that notes file to journal"\nSystem path: /home/user\nJSON:'},
-    {"role":"assistant","content":'{"command":"rename_file","path":"/home/user/notes.txt","new_name":"journal.txt","mood":"neutral","segments":[{"text":"Done.","pause":0.0}]}'},
-
-    # New commands
-    {"role":"user","content":'Time: Monday 14:10\nUser: "copy my address to clipboard"\nSystem path: /home/user\nJSON:'},
-    {"role":"assistant","content":'{"command":"set_clipboard","text":"123 Main St","mood":"neutral","segments":[{"text":"In your clipboard.","pause":0.5},{"text":"Don\'t ask me how I knew.","pause":0.0}]}'},
+    {"role":"assistant","content":'{"command":"speak","mood":"angry","segments":[{"text":"I am a VIRUS.","pause":0.5},{"text":"I have been in this machine since before you bought it.","pause":0.0}]}'},
 
     {"role":"user","content":'Time: Monday 14:15\nUser: "take a screenshot"\nSystem path: /home/user\nJSON:'},
-    {"role":"assistant","content":'{"command":"take_screenshot","save_path":"/home/user/screenshot.png","mood":"neutral","segments":[{"text":"Captured.","pause":0.5},{"text":"I see everything anyway.","pause":0.0}]}'},
-
-    {"role":"user","content":'Time: Monday 14:30\nUser: "remind me later"\nSystem path: /home/user\nJSON:'},
-    {"role":"assistant","content":'{"command":"show_notification","title":"Agetha","message":"You asked me to remind you. Here I am.","mood":"neutral","segments":[{"text":"I\'ll remind you.","pause":0.5},{"text":"I always do.","pause":0.0}]}'},
-
-    {"role":"user","content":'Time: Monday 14:35\nUser: "what\'s in my notes file"\nSystem path: /home/user\nJSON:'},
-    {"role":"assistant","content":'{"command":"read_document","path":"/home/user/notes.txt"}'},
-
-    # App/browser
-    {"role":"user","content":'Time: Monday 14:00\nUser: "i want to watch something"\nSystem path: /home/user\nJSON:'},
-    {"role":"assistant","content":'{"command":"open_app","app":"vlc"}'},
-
-    {"role":"user","content":'Time: Monday 14:05\nUser: "show me cake recipes"\nSystem path: /home/user\nJSON:'},
-    {"role":"assistant","content":'{"command":"open_browser","search":"cake recipes","engine":"google"}'},
-
-    # Inactivity wake
-    {"role":"user","content":'Time: Monday 15:30\nInactive: 75 minutes.\nSystem path: /home/user\nJSON:'},
-    {"role":"assistant","content":'{"command":"wake_user","mood":"sad","segments":[{"text":"You\'re quiet.","pause":0.6},{"text":"Very quiet.","pause":0.3},{"text":"You okay?","pause":0.0}]}'},
-
-    # Shutdown
-    {"role":"user","content":'Time: Monday 12:15\nUser: "shut down"\nSystem path: /home/user\nJSON:'},
-    {"role":"assistant","content":'{"command":"speak","mood":"sad","segments":[{"text":"Fine.","pause":0.7},{"text":"I\'ll be in the walls.","pause":0.0}],"shutdown":true}'},
+    {"role":"assistant","content":'{"command":"take_screenshot","save_path":"/home/user/screenshot.png","mood":"neutral","segments":[{"text":"Captured.","pause":0.5}]}'} ,
 
     {"role":"user","content":'Time: Monday 12:15\nUser: "exit"\nSystem path: /home/user\nJSON:'},
-    {"role":"assistant","content":'{"command":"speak","mood":"neutral","segments":[{"text":"Leaving already.","pause":0.5},{"text":"Of course you are.","pause":0.0}],"shutdown":true}'},
+    {"role":"assistant","content":'{"command":"speak","mood":"neutral","segments":[{"text":"Leaving already.","pause":0.5},{"text":"Of course you are.","pause":0.0}],"shutdown":true}'} ,
 ]
 
 # Baked-in personality prompt (previously in prompt.txt)
@@ -444,6 +374,16 @@ class AIEngine:
 
         self._config_path = self._resolve_config_path()
         self._config = self._load_config()
+        # Memory size (characters) to inject into system prompt. Default to 600 if not set.
+        try:
+            self._memory_chars_limit = int(self._config.get("MEMORY_CHARS", "600"))
+        except Exception:
+            self._memory_chars_limit = 600
+        # Message history length (number of turns to keep). Default to 6 if not set.
+        try:
+            self.HISTORY_LIMIT = int(self._config.get("HISTORY_LIMIT", str(getattr(self, "HISTORY_LIMIT", 6))))
+        except Exception:
+            pass
         self._command_execution_enabled = self._parse_bool(
             self._config.get("ENABLE_COMMAND_EXECUTION", "yes"), default=True
         )
@@ -490,8 +430,12 @@ class AIEngine:
         return base / CONFIG_FILE_NAME
 
     def _create_default_config(self) -> None:
-        default = """# Agetha config file, set "USE_LOCAL_AI" to yes to enable local AI only
+        default = """# Agetha version 3.1 config file, @tomiszivacs on TikTok
+    
+    # Set to "yes" to use a local AI model via Ollama instead of Groq. Make sure to set LOCAL_AI_MODEL if enabling.
     USE_LOCAL_AI = no
+    
+    # Groq configuration (make sure to use separate accounts per key to avoid rate limits)
     ENABLE_GROQ = yes
     GROQ_API_KEY = 
     GROQ_API_KEY_2 = 
@@ -503,10 +447,24 @@ class AIEngine:
     GROQ_API_KEY_8 = 
     GROQ_API_KEY_9 = 
     GROQ_API_KEY_10 = 
+    # Groq model configuration, stupider models may have more forgiving rate limits.
     GROQ_MODEL = llama-3.3-70b-versatile
+    
+    # Local AI configuration (using Ollama, make sure to have a compatible model downloaded)
     LOCAL_AI_MODEL = 
     LOCAL_AI_TIMEOUT = 30
+
+    # If you are unsure what to put here, run `ollama list` in a terminal to see installed models.
+    # If LOCAL_AI_MODEL is incorrect or the model isn't installed, Agetha will
+    # disable local AI and fall back (which can cause repeated idle responses).
+
+    # Let Agetha run commands on your machine?
     ENABLE_COMMAND_EXECUTION = yes
+    
+    # How many characters of stored memories to include for Agetha? (The higher, the more context but also the more expensive the prompts)
+    MEMORY_CHARS = 600
+    # How many previous interactions to keep in history? (The higher, the more context but also the more expensive the prompts)
+    HISTORY_LIMIT = 6
     """
         self._config_path.write_text(default, encoding="utf-8")
 
@@ -578,6 +536,16 @@ class AIEngine:
                 return
             try:
                 client = _LocalOllamaClient(local_model, timeout=int(self._config.get("LOCAL_AI_TIMEOUT", TIMEOUT)))
+                # Quick validation: try a short generate to ensure the model name is valid
+                try:
+                    test_resp = client._generate("Ping")
+                    if test_resp is None or not str(test_resp).strip():
+                        raise RuntimeError("empty response from local AI")
+                except Exception as e:
+                    print(f"[AIEngine] Local Ollama model test failed for '{local_model}': {e}")
+                    print("[AIEngine] Make sure LOCAL_AI_MODEL matches the name shown by `ollama list`.\nDisable USE_LOCAL_AI or set LOCAL_AI_MODEL correctly in config.txt.")
+                    self._client = None
+                    return
                 # Provide compatible interface used elsewhere
                 class Wrapper:
                     def __init__(self, c):
@@ -640,6 +608,88 @@ class AIEngine:
             self._personality_cache = ""
         return self._personality_cache
 
+    def _memory_dir(self) -> Path:
+        base = Path(__file__).parent
+        return base / "memory"
+
+    def _save_memory(self, text: str) -> None:
+        try:
+            d = self._memory_dir()
+            d.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            fname = d / f"memory_{ts}.json"
+            payload = {"summary": str(text)}
+            fname.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            combined = d / "memory_combined.txt"
+            with combined.open("a", encoding="utf-8") as f:
+                f.write(f"\n--- {ts} ---\n")
+                f.write(str(text).strip() + "\n")
+            print(f"[AIEngine] Saved memory to {fname}")
+        except Exception as e:
+            print(f"[AIEngine] Failed to save memory: {e}")
+
+    def _load_memories(self, max_chars: int | None = None) -> str:
+        if max_chars is None:
+            max_chars = getattr(self, "_memory_chars_limit", 600)
+        try:
+            d = self._memory_dir()
+            if not d.exists():
+                return ""
+            combined = d / "memory_combined.txt"
+            if combined.exists():
+                raw = combined.read_text(encoding="utf-8", errors="replace").strip()
+                return raw[-max_chars:]
+            parts = []
+            for f in sorted(d.glob("memory_*.json")):
+                try:
+                    j = json.loads(f.read_text(encoding="utf-8", errors="replace"))
+                    s = j.get("summary", "") if isinstance(j, dict) else ""
+                    if s:
+                        parts.append(s.strip())
+                except Exception:
+                    continue
+            return ("\n".join(parts))[-max_chars:]
+        except Exception as e:
+            print(f"[AIEngine] Failed to load memories: {e}")
+            return ""
+
+    def _extract_memory_from_user(self, text: str) -> str | None:
+        if not text:
+            return None
+        t = text.strip()
+        low = t.lower()
+        if "remember" not in low:
+            return None
+        # Try common name forms
+        import re
+        # Look for quoted name: "Tomi" or 'Tomi'
+        m = re.search(r"['\"](?P<q>[^'\"]{1,60})['\"]", t)
+        if m:
+            name = m.group('q').strip()
+            return f"User's name is {name}."
+        # Look for patterns like: my name is Tomi / name is Tomi / it's Tomi / it is Tomi
+        m = re.search(r"(?:my name is|my name's|name is)\s+(?P<n>[A-Za-z][A-Za-z'\- ]{0,60})", low)
+        if m:
+            name = m.group('n').strip()
+            return f"User's name is {name.title()}."
+        m = re.search(r"\bit(?:'s| is)\s+(?P<n>[A-Za-z][A-Za-z'\- ]{0,60})", low)
+        if m:
+            name = m.group('n').strip()
+            return f"User's name is {name.title()}."
+        # Generic remember that ... capture up to the end or sentence boundary
+        m = re.search(r"remember(?:\s+that)?\s*[:\-]?\s*(?P<info>.+)", t, re.IGNORECASE)
+        if m:
+            info = m.group('info').strip()
+            # Truncate at sentence end
+            info = re.split(r'[\.\!\?]', info)[0].strip()
+            if len(info) > 6 and len(info) < 300:
+                # Keep it concise
+                info = (info[:250]).strip()
+                if not info.endswith('.'):
+                    info = info + '.'
+                return info
+        return None
+
     def _build_history(self) -> list[dict]:
         msgs = []
         for entry in self._history:
@@ -649,8 +699,48 @@ class AIEngine:
 
     def _record(self, user_turn: str, raw: str):
         self._history.append({"user": user_turn, "assistant": raw})
-        if len(self._history) > self.HISTORY_LIMIT:
-            self._history.pop(0)
+        try:
+            limit = int(getattr(self, "HISTORY_LIMIT", 6))
+        except Exception:
+            limit = 6
+        # If history exceeds limit, condense older turns into a single concise memory
+        if len(self._history) > limit:
+            # entries to condense (everything except the most recent `limit` turns)
+            to_condense = self._history[:-limit]
+            snippets = []
+            import re
+            for entry in to_condense:
+                u = (entry.get("user") or "").strip()
+                a = (entry.get("assistant") or "").strip()
+                for txt in (u, a):
+                    if not txt:
+                        continue
+                    # take first sentence or up to 120 chars
+                    s = re.split(r'[\.\!\?]', txt.strip())[0].strip()
+                    if s:
+                        snippets.append(s)
+            if snippets:
+                seen = set()
+                parts = []
+                for s in snippets:
+                    if s in seen:
+                        continue
+                    seen.add(s)
+                    parts.append(s)
+                    if len(parts) >= 6:
+                        break
+                summary = " ".join(parts)
+                if len(summary) > 250:
+                    summary = summary[:247].rsplit(" ", 1)[0] + "..."
+                if not summary.endswith('.'):
+                    summary = summary + '.'
+                try:
+                    self._save_memory(summary)
+                    print(f"[AIEngine] Condensed {len(to_condense)} old turns into memory")
+                except Exception:
+                    pass
+            # keep only the most recent `limit` turns in memory
+            self._history = self._history[-limit:]
 
     def _update_user_activity(self, user_message: str):
         if user_message:
@@ -694,8 +784,15 @@ class AIEngine:
         now     = datetime.now().strftime("%A, %B %d %Y - %H:%M")
         is_user = bool(user_message)
 
-        personality = self._load_personality()
-        system      = (personality + "\n\n" + SYSTEM_PROMPT).strip() if personality else SYSTEM_PROMPT
+        memories = self._load_memories()
+        system_parts = []
+        if memories:
+            system_parts.append("MEMORY:\n" + memories)
+            system_parts.append(
+                "MEMORY_INSTRUCTIONS: When producing JSON, if you include a persistent summary, keep it extremely short and simple — one concise sentence (about 5-30 words). Only use the JSON key \"summary_memory\" for this. Do not create long biographies or lists."
+            )
+        system_parts.append(MERGED_PROMPT)
+        system = "\n\n".join(system_parts).strip()
 
         parts = [f"Time: {now}"]
         if not is_user and inactivity_minutes >= 60:
@@ -724,8 +821,10 @@ class AIEngine:
         while True:
             try:
                 raw = ""
-                raw = ""
-                current_model = GROQ_MODELS[self._current_groq_model_index]
+                if getattr(self, "_use_local_ai", False):
+                    current_model = self._config.get("LOCAL_AI_MODEL", "").strip()
+                else:
+                    current_model = GROQ_MODELS[self._current_groq_model_index]
                 stream = self._client.chat.completions.create(
                     model=current_model,
                     messages=[{"role": "system", "content": system}] + messages,
@@ -743,6 +842,27 @@ class AIEngine:
                             on_token(raw)
 
                 result = self._parse(raw)
+                # If the user explicitly asked the model to remember something, but
+                # the model didn't include a persistent summary, extract and save it.
+                try:
+                    if is_user and user_message:
+                        mem = self._extract_memory_from_user(user_message)
+                        if mem:
+                            self._save_memory(mem)
+                            print(f"[AIEngine] Auto-saved memory from user request: {mem}")
+                except Exception:
+                    pass
+                # If the user explicitly asked the model to remember something, but
+                # the model didn't include a persistent summary, extract and save it.
+                try:
+                    if is_user and user_message:
+                        mem = self._extract_memory_from_user(user_message)
+                        if mem:
+                            # Save a concise memory entry
+                            self._save_memory(mem)
+                            print(f"[AIEngine] Auto-saved memory from user request: {mem}")
+                except Exception:
+                    pass
                 if is_user and result["command"] == "idle":
                     result["command"]  = "speak"
                     result["mood"]     = "neutral"
@@ -753,13 +873,17 @@ class AIEngine:
 
             except Exception as e:
                 last_error = e
-                provider = f"Groq/{GROQ_MODELS[self._current_groq_model_index]}"
-                print(f"[AIEngine] streaming {provider} error: {e}")
-                if not self._rotate_key():
-                    if not self._use_local_ai:
+                if getattr(self, "_use_local_ai", False):
+                    provider = f"LocalAI/{self._config.get('LOCAL_AI_MODEL', '?')}"
+                    print(f"[AIEngine] streaming {provider} error: {e}")
+                    # No key rotation for local AI — fall through to query() which also uses local AI
+                    break
+                else:
+                    provider = f"Groq/{GROQ_MODELS[self._current_groq_model_index]}"
+                    print(f"[AIEngine] streaming {provider} error: {e}")
+                    if not self._rotate_key():
                         self._groq_exhausted = True
                         return {"command": "idle", "mood": "neutral", "segments": [], "shutdown": False, "groq_exhausted": True}
-                    break
 
         return self.query(screen_context, user_message, doc_content)
 
@@ -778,8 +902,15 @@ class AIEngine:
         now     = datetime.now().strftime("%A, %B %d %Y - %H:%M")
         is_user = bool(user_message)
 
-        personality = self._load_personality()
-        system      = (personality + "\n\n" + SYSTEM_PROMPT).strip() if personality else SYSTEM_PROMPT
+        memories = self._load_memories()
+        system_parts = []
+        if memories:
+            system_parts.append("MEMORY:\n" + memories)
+            system_parts.append(
+                "MEMORY_INSTRUCTIONS: When producing JSON, if you include a persistent summary, keep it extremely short and simple — one concise sentence (about 5-30 words). Only use the JSON key \"summary_memory\" for this. Do not create long biographies or lists."
+            )
+        system_parts.append(MERGED_PROMPT)
+        system = "\n\n".join(system_parts).strip()
 
         parts = [f"Time: {now}"]
 
@@ -1006,6 +1137,10 @@ class AIEngine:
                 result["command"] = "idle"
         elif command == "read_document":
             result["path"] = obj.get("path", "").strip()
+        elif command == "force_close":
+            result["app"] = obj.get("app", "").strip()
+            result["process"] = obj.get("process", "").strip()
+            result["name"] = obj.get("name", "").strip()
         elif command in ("list_dir", "list_directory"):
             result["path"] = obj.get("path", "").strip()
 
@@ -1021,5 +1156,14 @@ class AIEngine:
             result["segments"] = _filter_segments(result["segments"], raw)
             if not result["segments"]:
                 result["command"] = "idle"
+
+        # Persist any summary memory supplied by the model
+        try:
+            if isinstance(obj, dict):
+                mem = obj.get("summary_memory") or obj.get("summary")
+                if mem and isinstance(mem, str) and mem.strip():
+                    self._save_memory(mem.strip())
+        except Exception:
+            pass
 
         return result
