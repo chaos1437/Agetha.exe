@@ -333,89 +333,79 @@ class SubtitleRenderer:
             self._canvas.after(0, on_done)
 
     def _draw(self, text: str, color: str = "#ffffff"):
-        self._canvas.delete("all")
-        cw = self._canvas.winfo_width()  or WINDOW_W
+        cw = self._canvas.winfo_width() or WINDOW_W
         ch = self._canvas.winfo_height() or 110
         max_w = max(40, cw - 24)
-        char_w = max(4, self._font_size * 0.62)
-        # break extremely long words so wrapping can occur
-        max_chars = max(8, int(max_w // char_w))
-        import re
-        parts = []
-        for w in re.split(r'(\s+)', text):
-            if w.isspace() or not w:
-                parts.append(w)
-                continue
-            if len(w) <= max_chars:
-                parts.append(w)
-            else:
-                # chunk the long token into pieces with spaces between
-                chunks = [w[i:i+max_chars] for i in range(0, len(w), max_chars)]
-                parts.append(" ".join(chunks))
-        wrapped_text = "".join(parts).strip()
+        max_lines = 4
+        min_font_size = 8
 
+        import re
+
+        def estimate_lines(word_list, chars_per_line):
+            line_chars = 0
+            lines = 1
+            for w in word_list:
+                needed = len(w) + (1 if line_chars > 0 else 0)
+                if line_chars > 0 and line_chars + needed > chars_per_line:
+                    lines += 1
+                    line_chars = len(w)
+                else:
+                    line_chars += needed
+            return lines
+
+        # Start at the base font size and shrink until text fits within max_lines
+        font_size = self._font_size
+        font = self._font
+        words = text.split()
+        if not words:
+            self._canvas.delete("all")
+            return
+
+        while font_size >= min_font_size:
+            char_w = max(4, font_size * 0.62)
+            chars_per_line = max(1, int(max_w // char_w))
+
+            # Break long words for this font size
+            parts = []
+            for w in re.split(r'(\s+)', text):
+                if w.isspace() or not w:
+                    parts.append(w)
+                    continue
+                if len(w) <= chars_per_line:
+                    parts.append(w)
+                else:
+                    chunks = [w[i:i+chars_per_line] for i in range(0, len(w), chars_per_line)]
+                    parts.append(" ".join(chunks))
+            candidate_words = "".join(parts).strip().split()
+
+            if estimate_lines(candidate_words, chars_per_line) <= max_lines:
+                break
+
+            # Doesn't fit — shrink font and retry
+            font_size -= 1
+            font = self._load_font(font_size)
+
+        candidate = " ".join(candidate_words)
         x = cw // 2
 
-        # helper to create text, measure, and ensure max 3 lines by trimming leading words
-        def render_for(text_to_draw):
-            # draw shadow and main text, measure height
-            shadow_id = None
-            text_id = None
-            try:
-                shadow_id = self._canvas.create_text(x + 2, 6 + 2, text=text_to_draw, fill="#000000", font=self._font, anchor="n", width=max_w, justify="center")
-                text_id = self._canvas.create_text(x, 6, text=text_to_draw, fill=color, font=self._font, anchor="n", width=max_w, justify="center")
-                # force layout update to get bbox
-                try:
-                    self._canvas.update_idletasks()
-                except Exception:
-                    pass
-                bbox = self._canvas.bbox(text_id)
-                if not bbox:
-                    return shadow_id, text_id, 1
-                height = bbox[3] - bbox[1]
-                # estimate line count
-                line_h = self._font_size + 7
-                lines = max(1, int(math.ceil(height / line_h)))
-                return shadow_id, text_id, lines
-            except Exception:
-                # fallback: create single centered text
-                if text_id is None:
-                    text_id = self._canvas.create_text(x, 6, text=text_to_draw, fill=color, font=self._font, anchor="n")
-                return shadow_id, text_id, 1
-
-        words = wrapped_text.split()
-        if not words:
-            return
-
-        cur_words = words[:]
-        shadow_id = text_id = None
-        # Trim leading words until wrapped text fits within 3 lines (prefer showing newest content)
-        while cur_words:
-            candidate = " ".join(cur_words)
-            # clear temporary items before rendering attempt
-            self._canvas.delete("all")
-            shadow_id, text_id, lines = render_for(candidate)
-            if lines <= 3:
-                break
-            # drop the oldest word to show the most recent content
-            cur_words.pop(0)
-
-        if not text_id:
-            return
-
-        # center vertically based on actual bbox
+        # Single delete + draw — no intermediate redraws
+        self._canvas.delete("all")
         try:
+            shadow_id = self._canvas.create_text(
+                x + 2, 6 + 2, text=candidate, fill="#000000",
+                font=font, anchor="n", width=max_w, justify="center"
+            )
+            text_id = self._canvas.create_text(
+                x, 6, text=candidate, fill=color,
+                font=font, anchor="n", width=max_w, justify="center"
+            )
+            # Vertically center using bbox (no update_idletasks — avoids forced layout flush)
             bbox = self._canvas.bbox(text_id)
             if bbox:
                 height = bbox[3] - bbox[1]
                 y = max(6, (ch - height) // 2)
-                # update positions of both shadow and main text
-                try:
-                    if shadow_id:
-                        self._canvas.coords(shadow_id, x + 2, y + 2)
-                    self._canvas.coords(text_id, x, y)
-                except Exception:
-                    pass
+                self._canvas.coords(shadow_id, x + 2, y + 2)
+                self._canvas.coords(text_id, x, y)
         except Exception:
             pass
 
@@ -530,6 +520,7 @@ class CompanionApp:
         self._gif_cache: dict[str, GifPlayer] = {}
         self._talking_rotate_job = None
         self._poll_job = None
+        self._persistent_mood: str | None = None  # holds sad/angry across speech→idle
 
         self._bleep  = BleepPlayer()
         self._screen = ScreenReader()
@@ -614,6 +605,8 @@ class CompanionApp:
         self._input_var.set("")
         self._input_box.config(state="disabled")
         self._send_btn.config(state="disabled")
+        # Clear any sticky mood — new interaction resets expression
+        self._persistent_mood = None
         threading.Thread(target=self._ai_tick, kwargs={"user_message": text}, daemon=True).start()
 
     def _re_enable_input(self):
@@ -683,12 +676,18 @@ class CompanionApp:
         self._stop_talking_rotation()
         self._bleep.stop()
 
+        # Moods that should linger after speech ends (until next response or explicit idle)
+        _STICKY_MOODS = {"sad", "angry"}
+
         if state == self.STATE_SLEEPING:
+            self._persistent_mood = None
             self._play_gif("sleeping.gif")
         elif state == self.STATE_THINKING:
             self._play_gif("thinking.gif")
         elif state == self.STATE_IDLE:
-            mood_gif = self.EXTRA_GIFS.get(mood)
+            # If we have a sticky mood carry it forward; a new response will clear it
+            effective_mood = self._persistent_mood if self._persistent_mood else mood
+            mood_gif = self.EXTRA_GIFS.get(effective_mood)
             if mood_gif and mood_gif in self._gif_cache:
                 self._play_gif(mood_gif)
             else:
@@ -701,6 +700,11 @@ class CompanionApp:
             except Exception:
                 self._loaf_job = None
         elif state == self.STATE_TALKING:
+            # Record sticky mood when Agetha starts talking in a strong mood
+            if mood in _STICKY_MOODS:
+                self._persistent_mood = mood
+            else:
+                self._persistent_mood = None
             mood_gif = self.EXTRA_GIFS.get(mood)
             if mood_gif and mood_gif in self._gif_cache and mood != "neutral":
                 self._play_gif(mood_gif)
@@ -1117,10 +1121,13 @@ class CompanionApp:
                 on_done=lambda: self._on_speech_done(shutdown_requested)
             ))
         else:
+            # Explicit idle response — clear any sticky mood so we return to normal
+            self._persistent_mood = None
             self.root.after(0, lambda: self._set_state(self.STATE_IDLE, mood))
             self._reschedule_screen_poll()
 
     def _on_speech_done(self, shutdown: bool = False):
+        # Keep _persistent_mood — _set_state(STATE_IDLE) will pick it up
         self.root.after(0, lambda: self._set_state(self.STATE_IDLE))
         if shutdown:
             self.root.after(50, self._shutdown)
