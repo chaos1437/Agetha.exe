@@ -415,10 +415,15 @@ class AgethaPopup:
 
     def __init__(self, parent: tk.Tk, messages: list, mood: str = "neutral"):
         self._win = tk.Toplevel(parent)
-        self._win.title("Agetha.exe")
+        # Use default window decorations so the native titlebar (X button) appears
+        try:
+            self._win.title("Agetha.exe")
+        except Exception:
+            pass
         self._win.resizable(False, False)
         self._win.attributes("-topmost", True)
         self._win.configure(bg="#0a0a0f")
+
 
         accent = {
             "angry":     "#8b1a1a",
@@ -431,6 +436,7 @@ class AgethaPopup:
             "neutral":   "#1e2d3d",
         }.get(mood, "#1e2d3d")
 
+        # Native title bar (restored)
         title_bar = tk.Frame(self._win, bg=accent, height=26)
         title_bar.pack(fill="x")
         title_bar.pack_propagate(False)
@@ -482,6 +488,14 @@ class AgethaPopup:
         self._win.bind("<Return>", lambda _: self._win.destroy())
         self._win.bind("<Escape>", lambda _: self._win.destroy())
         self._win.focus_force()
+
+    def _on_drag_start(self, event):
+        # removed: drag handling not needed with native titlebar
+        return
+
+    def _on_drag_motion(self, event):
+        # removed: drag handling not needed with native titlebar
+        return
 
 
 class CompanionApp:
@@ -578,15 +592,7 @@ class CompanionApp:
         self._input_box.pack(side="left", fill="x", expand=True, ipady=4)
         self._input_box.bind("<Return>", self._on_user_input)
 
-        self._send_btn = tk.Button(
-            input_frame, text="→",
-            font=btn_font,
-            bg="#223344", fg="#88bbdd",
-            activebackground="#334455", activeforeground="#ffffff",
-            relief="flat", bd=0, padx=8,
-            command=self._on_user_input,
-        )
-        self._send_btn.pack(side="left", padx=(4, 0), ipady=4)
+        # No separate send button: pressing Enter sends the message
 
     def _drag_start(self, e):
         self._drag_x, self._drag_y = e.x, e.y
@@ -604,14 +610,12 @@ class CompanionApp:
             return
         self._input_var.set("")
         self._input_box.config(state="disabled")
-        self._send_btn.config(state="disabled")
         # Clear any sticky mood — new interaction resets expression
         self._persistent_mood = None
         threading.Thread(target=self._ai_tick, kwargs={"user_message": text}, daemon=True).start()
 
     def _re_enable_input(self):
         self._input_box.config(state="normal")
-        self._send_btn.config(state="normal")
         self._input_box.focus_set()
 
     def _preload_gifs(self):
@@ -744,7 +748,6 @@ class CompanionApp:
         is_user = user_message is not None
 
         self.root.after(0, lambda: self._input_box.config(state="disabled"))
-        self.root.after(0, lambda: self._send_btn.config(state="disabled"))
 
         screen_text = ""
         if not is_user:
@@ -1225,7 +1228,7 @@ def _early_config_check():
     if config_path.exists():
         return  # Nothing to do
 
-    default_config = """# Agetha version 3.2.1 config file, @tomiszivacs on TikTok
+    default_config = """# Agetha version 3.2.2 config file, @tomiszivacs on TikTok
     
     # Set to "yes" to use a local AI model via Ollama instead of Groq. Make sure to set LOCAL_AI_MODEL if enabling.
     USE_LOCAL_AI = no
