@@ -63,6 +63,7 @@ VALID_COMMANDS = {
     "set_clipboard", "play_sound", "take_screenshot",
     "show_notification", "run_command", "read_document",
     "list_dir", "list_directory", "force_close",
+    "show_error_gif", "move_window",
 }
 
 # ── SINGLE compact system prompt ─────────────────────────────────────────────
@@ -176,6 +177,16 @@ def _filter_segments(segments: list, raw: str = "") -> list:
     if not clean and segments:
         print(f"[AIEngine] All segments filtered. Raw: {raw[:400]}")
     if clean:
+        # fix common assistant typos and enforce final pause 0.0
+        for s in clean:
+            try:
+                t = str(s.get("text", ""))
+                # correct common misspelling seen in the wild
+                t = re.sub(r"\bi tought\b", "i thought", t, flags=re.I)
+                t = re.sub(r"\btought\b", "thought", t, flags=re.I)
+                s["text"] = t
+            except Exception:
+                pass
         clean[-1]["pause"] = 0.0
     return clean
 
@@ -193,10 +204,32 @@ class AIEngine:
         self._config_path = self._resolve_config_path()
         self._config = self._load_config()
 
+        # Conversation log (cleared on every startup)
+        try:
+            self._conversation_path = self._config_path.parent / "conversation.txt"
+            self._conversation_path.write_text("", encoding="utf-8")
+        except Exception as e:
+            print(f"[AIEngine] Could not initialize conversation log: {e}")
+
+        # compact characters summary included in the system prompt to save tokens
+        try:
+            self._compact_chars = self._load_compact_characters()
+        except Exception:
+            self._compact_chars = ""
+
+        # fatal error flags (show error gif when set)
+        self._fatal_local_ai_error = False
+        self._show_error_gif = False
+        self._error_gif_path = str(self._config_path.parent / "assets" / "error.gif")
+
         try:
             self._memory_chars_limit = int(self._config.get("MEMORY_CHARS", "600"))
         except Exception:
             self._memory_chars_limit = 600
+        try:
+            self._file_read_chars = int(self._config.get("FILE_READ_CHARS", "200"))
+        except Exception:
+            self._file_read_chars = 200
         try:
             self.HISTORY_LIMIT = int(self._config.get("HISTORY_LIMIT", "6"))
         except Exception:
@@ -248,7 +281,6 @@ class AIEngine:
         default = """\
 # Agetha config file
 USE_LOCAL_AI = no
-ENABLE_GROQ = yes
 GROQ_API_KEY =
 GROQ_API_KEY_2 =
 GROQ_API_KEY_3 =
@@ -265,8 +297,29 @@ LOCAL_AI_TIMEOUT = 30
 ENABLE_COMMAND_EXECUTION = yes
 MEMORY_CHARS = 600
 HISTORY_LIMIT = 6
+FILE_READ_CHARS = 200
 """
         self._config_path.write_text(default, encoding="utf-8")
+
+    def _load_compact_characters(self) -> str:
+        try:
+            chars_file = self._config_path.parent / "characters.txt"
+            if not chars_file.exists():
+                return ""
+            lines = []
+            for ln in chars_file.read_text(encoding="utf-8", errors="replace").splitlines():
+                s = ln.split("#", 1)[0].strip()
+                if not s:
+                    continue
+                # take only short names or leading phrase to keep it compact
+                s = s.split("-", 1)[0].strip()
+                lines.append(s)
+            compact = ", ".join(lines)
+            if len(compact) > 300:
+                compact = compact[:297].rsplit(" ", 1)[0] + "..."
+            return compact
+        except Exception:
+            return ""
 
     @staticmethod
     def _show_first_run_popup() -> None:
@@ -307,6 +360,7 @@ HISTORY_LIMIT = 6
             config[k.strip().upper()] = v.strip()
         return config
 
+
     @staticmethod
     def _resolve_system_path() -> str:
         if platform.system() == "Windows":
@@ -333,7 +387,10 @@ HISTORY_LIMIT = 6
                 print(f"[AIEngine] Using local Ollama model: {local_model}")
             except Exception as e:
                 print(f"[AIEngine] Local Ollama init failed: {e}")
+                # fatal local AI error → show error gif indefinitely
                 self._client = None
+                self._fatal_local_ai_error = True
+                self._show_error_gif = True
             return
 
         if self._enable_groq and self._groq_keys:
@@ -435,6 +492,31 @@ HISTORY_LIMIT = 6
                 print(f"[AIEngine] Condensed {len(to_condense)} turns → memory ({len(snippets)} user msgs)")
             self._history = self._history[-limit:]
 
+        # append to conversation log (only the user's message + raw assistant output)
+        try:
+            if hasattr(self, "_conversation_path") and self._conversation_path:
+                t = datetime.now().isoformat()
+                # extract only User: "..." content from the prompt
+                user_msg = ""
+                m = re.search(r'User:\s*"([^"]*)"', user_turn)
+                if m:
+                    user_msg = m.group(1).strip()
+                else:
+                    # fallback: try to find a bare line starting with User:
+                    m2 = re.search(r'^User:\s*(.*)$', user_turn, re.MULTILINE)
+                    if m2:
+                        user_msg = m2.group(1).strip()
+
+                with (self._conversation_path).open("a", encoding="utf-8") as f:
+                    f.write(f"TIME: {t}\n")
+                    f.write("USER:\n")
+                    f.write((user_msg or "[ambient]") + "\n")
+                    f.write("AI_RAW:\n")
+                    f.write(raw.strip() + "\n")
+                    f.write("---\n")
+        except Exception as e:
+            print(f"[AIEngine] Could not write conversation log: {e}")
+
     def _update_user_activity(self, user_message: str):
         if user_message: self._last_user_interaction_time = time.time()
 
@@ -446,9 +528,13 @@ HISTORY_LIMIT = 6
             p = Path(path)
             if not p.exists(): return f"[file not found: {path}]"
             if not p.is_file(): return f"[not a file: {path}]"
-            if p.stat().st_size > 2000: return f"[file too large: {p.stat().st_size} bytes]"
+            # Allow limiting how many characters are read from a file via config FILE_READ_CHARS
+            max_chars = getattr(self, "_file_read_chars", 200)
+            # still avoid insane file sizes
+            if p.stat().st_size > 200000:
+                return f"[file too large: {p.stat().st_size} bytes]"
             text = p.read_text(encoding="utf-8", errors="replace").strip()
-            return (text[:2000] if text else "[empty file]")
+            return (text[:max_chars] if text else "[empty file]")
         except Exception as e:
             return f"[error reading file: {e}]"
 
@@ -462,6 +548,15 @@ HISTORY_LIMIT = 6
 
         memories = self._load_memories()
         system = SYSTEM_PROMPT
+        # include compact characters summary to save tokens
+        if getattr(self, "_compact_chars", ""):
+            system = (
+                f"CHARACTERS: {self._compact_chars}\n\n"
+                "To move the app window, emit a JSON command: {\"command\":\"move_window\", \"direction\":\"left\"} "
+                "or provide coordinates: {\"command\":\"move_window\", \"x\":100, \"y\":200}.\n\n"
+                "If the user has been idle a long time, you may say 'I'm still waiting' or 'I'm bored'.\n\n"
+                + system
+            )
         if memories:
             system = f"MEMORY:\n{memories}\n\nMEMORY_INSTRUCTIONS: summary_memory key only, one concise sentence (5–30 words).\n\n{system}"
 
@@ -490,6 +585,10 @@ HISTORY_LIMIT = 6
         doc_content: str = "",
         on_token=None,
     ) -> dict:
+        # If a fatal error occurred (local Ollama not available) or we've flagged network errors,
+        # instruct the front-end to show the error gif indefinitely.
+        if getattr(self, "_show_error_gif", False):
+            return {"command": "show_error_gif", "path": getattr(self, "_error_gif_path", ""), "segments": [], "shutdown": False}
         if self._client is None:
             return {"command": "idle", "mood": "neutral", "segments": [], "shutdown": False}
 
@@ -528,6 +627,11 @@ HISTORY_LIMIT = 6
                 provider = (f"LocalAI/{self._config.get('LOCAL_AI_MODEL','?')}"
                             if self._use_local_ai else f"Groq/{GROQ_MODELS[self._current_groq_model_index]}")
                 print(f"[AIEngine] {provider} error: {e}")
+                # If it's a network/unreachable-type error for Groq, show error gif
+                errtxt = str(e).lower()
+                if not self._use_local_ai and (isinstance(e, (OSError, ConnectionError, TimeoutError)) or "connection" in errtxt or "network" in errtxt or "unreachable" in errtxt):
+                    self._show_error_gif = True
+                    return {"command": "show_error_gif", "path": getattr(self, "_error_gif_path", ""), "segments": [], "shutdown": False}
                 if self._use_local_ai:
                     break
                 if not self._rotate_key():
@@ -538,6 +642,9 @@ HISTORY_LIMIT = 6
         return self.query(screen_context, user_message, doc_content)
 
     def query(self, screen_context: str = "", user_message: str = "", doc_content: str = "") -> dict:
+        # If fatal error flagged, show error gif instead of attempting backends
+        if getattr(self, "_show_error_gif", False):
+            return {"command": "show_error_gif", "path": getattr(self, "_error_gif_path", ""), "segments": [], "shutdown": False}
         if self._client is None:
             return {"command": "idle", "mood": "neutral", "segments": [], "shutdown": False}
 
@@ -569,6 +676,10 @@ HISTORY_LIMIT = 6
                 return result
             except Exception as e:
                 print(f"[AIEngine] Groq/{GROQ_MODELS[self._current_groq_model_index]} error: {e}")
+                errtxt = str(e).lower()
+                if not self._use_local_ai and (isinstance(e, (OSError, ConnectionError, TimeoutError)) or "connection" in errtxt or "network" in errtxt or "unreachable" in errtxt):
+                    self._show_error_gif = True
+                    return {"command": "show_error_gif", "path": getattr(self, "_error_gif_path", ""), "segments": [], "shutdown": False}
                 if not self._rotate_key():
                     if not self._use_local_ai:
                         self._groq_exhausted = True
@@ -672,6 +783,7 @@ HISTORY_LIMIT = 6
             "force_close":       [("app",""),("process",""),("name","")],
             "list_dir":          [("path","")],
             "list_directory":    [("path","")],
+            "move_window":       [("x",0),("y",0),("direction","")],
         }
         if command in _cmd_fields:
             for field, default in _cmd_fields[command]:
@@ -705,5 +817,36 @@ HISTORY_LIMIT = 6
                 if mem and isinstance(mem, str) and mem.strip():
                     self._save_memory(mem.strip())
         except Exception: pass
+
+        # Translate run_command move_window invocations into structured move_window command
+        try:
+            if result.get("command") == "run_command":
+                cmdtxt = (obj.get("cmd") or result.get("cmd") or "").strip()
+                if cmdtxt.lower().startswith("move_window"):
+                    # patterns: move_window <x> <y> OR move_window left|right|up|down|center
+                    m = re.match(r'move_window\s+(-?\d+)\s*,?\s*(-?\d+)', cmdtxt, re.I)
+                    direction = None
+                    x = None; y = None
+                    if m:
+                        try:
+                            x = int(m.group(1)); y = int(m.group(2))
+                        except Exception:
+                            x = None; y = None
+                    else:
+                        m2 = re.search(r'move_window\s+(left|right|up|down|center)', cmdtxt, re.I)
+                        if m2:
+                            direction = m2.group(1).lower()
+
+                    new = {"command": "move_window", "mood": result.get("mood", "neutral"),
+                           "segments": result.get("segments", []), "shutdown": result.get("shutdown", False)}
+                    if x is not None and y is not None:
+                        new["x"] = x; new["y"] = y
+                    elif direction:
+                        new["direction"] = direction
+                    else:
+                        new["direction"] = "left"
+                    result = new
+        except Exception:
+            pass
 
         return result
