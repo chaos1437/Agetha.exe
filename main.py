@@ -435,7 +435,7 @@ class AgethaPopup:
         title_bar.pack(fill="x")
         title_bar.pack_propagate(False)
         tk.Label(
-            title_bar, text="⚠  Agetha.exe — System Message",
+            title_bar, text="⚠  Agetha.exe",
             bg=accent, fg="#ccccdd",
             font=("Courier", 9, "bold"),
             anchor="w", padx=8,
@@ -795,6 +795,65 @@ class CompanionApp:
             else:
                 self.root.after(0, lambda: self._set_state(self.STATE_IDLE, resp_mood))
                 self._reschedule_screen_poll()
+
+        # --- New: show_error_gif handling (display gif indefinitely) ---
+        if command == "show_error_gif":
+            path = response.get("path", "") or str(ASSETS / "error.gif")
+            try:
+                # Try to load the provided gif directly; fall back to bundled asset
+                gif_path = Path(path)
+                if not gif_path.exists():
+                    gif_path = ASSETS / "error.gif"
+                name = str(gif_path)
+                # create a temporary GifPlayer for this path and play it
+                player = GifPlayer(self._gif_label, name, self.root.after)
+                self._current_gif_player and self._current_gif_player.stop()
+                self._current_gif_player = player
+                player.play()
+                # Keep window always-on-top and idle
+                self.root.after(0, lambda: self._set_state(self.STATE_IDLE, "neutral"))
+                # Do not reschedule normal polling while error gif is showing
+                return
+            except Exception as e:
+                print(f"[ERROR_GIF] Failed to show error gif: {e}")
+
+        # --- New: move_window handling ---
+        if command == "move_window":
+            # Accept explicit x,y or a direction string
+            try:
+                x = response.get("x", None)
+                y = response.get("y", None)
+                direction = response.get("direction", "").lower() if isinstance(response.get("direction", ""), str) else ""
+
+                sw = self.root.winfo_screenwidth()
+                sh = self.root.winfo_screenheight()
+                ww = self.root.winfo_width() or WINDOW_W
+                wh = self.root.winfo_height() or WINDOW_H
+
+                if x is not None and y is not None:
+                    nx = int(x); ny = int(y)
+                else:
+                    curx = self.root.winfo_x(); cury = self.root.winfo_y()
+                    if direction == "left":
+                        nx = 10; ny = cury
+                    elif direction == "right":
+                        nx = max(0, sw - ww - 10); ny = cury
+                    elif direction == "up":
+                        nx = curx; ny = 10
+                    elif direction == "down":
+                        nx = curx; ny = max(0, sh - wh - 50)
+                    elif direction == "center":
+                        nx = max(0, (sw - ww) // 2); ny = max(0, (sh - wh) // 2)
+                    else:
+                        # default: move left
+                        nx = 10; ny = cury
+
+                self.root.geometry(f"+{nx}+{ny}")
+                print(f"[UI] Moved window to: {nx},{ny}")
+            except Exception as e:
+                print(f"[UI] Failed to move window: {e}")
+            _speak_and_continue(segments, mood, shutdown_requested)
+            return
 
         if command == "request_path":
             hint = response.get("path_hint", "").strip()
@@ -1166,13 +1225,12 @@ def _early_config_check():
     if config_path.exists():
         return  # Nothing to do
 
-    default_config = """# Agetha version 3.1 config file, @tomiszivacs on TikTok
+    default_config = """# Agetha version 3.2.1 config file, @tomiszivacs on TikTok
     
     # Set to "yes" to use a local AI model via Ollama instead of Groq. Make sure to set LOCAL_AI_MODEL if enabling.
     USE_LOCAL_AI = no
     
     # Groq configuration (make sure to use separate accounts per key to avoid rate limits)
-    ENABLE_GROQ = yes
     GROQ_API_KEY = 
     GROQ_API_KEY_2 = 
     GROQ_API_KEY_3 = 
@@ -1201,6 +1259,8 @@ def _early_config_check():
     MEMORY_CHARS = 600
     # How many previous interactions to keep in history? (The higher, the more context but also the more expensive the prompts)
     HISTORY_LIMIT = 6
+    # How many characters Agetha can read from a file? (The higher, the more Agetha can understand documents but also the more expensive the prompts)
+    FILE_READ_CHARS = 200
 """
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(default_config, encoding="utf-8")
