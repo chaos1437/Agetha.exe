@@ -4,7 +4,7 @@ Requires: pip install pillow pyautogui pytesseract numpy pygame requests
 Assets folder must contain: idle-1.gif, idle-2.gif, idle-3.gif,
   talking-1.gif, talking-2.gif, talking-3.gif,
   thinking.gif, sleeping.gif, happy.gif, surprised.gif, sad.gif, excited.gif, angry.gif
-Font: barrio.ttf must be in project root
+Font: barrio.ttf must be in assets/ folder
 """
 
 import tkinter as tk
@@ -27,10 +27,10 @@ from screen_reader import ScreenReader
 import sys
 BASE_DIR = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
 ASSETS      = BASE_DIR / "assets"
-FONT_PATH   = BASE_DIR / "barrio.ttf"
+FONT_PATH   = ASSETS / "barrio.ttf"
 
 WINDOW_W = 340
-WINDOW_H = 510
+WINDOW_H = 560
 GIF_W    = 340
 GIF_H    = 300
 
@@ -46,6 +46,21 @@ BLEEP_TONES = {
     "whisper":   220,
     "angry":     185,
 }
+
+
+# ── Windows 95 colour palette ──────────────────────────────────────────────
+W95_BG        = "#c0c0c0"
+W95_TITLE_BG  = "#000080"
+W95_TITLE_FG  = "#ffffff"
+W95_TEXT      = "#000000"
+W95_INPUT_BG  = "#ffffff"
+W95_SHADOW    = "#808080"
+W95_BTN_BG    = "#c0c0c0"
+W95_BTN_ACT   = "#000080"
+W95_BTN_AFG   = "#ffffff"
+W95_FONT      = ("MS Sans Serif", 8)
+W95_FONT_BOLD = ("MS Sans Serif", 8, "bold")
+# ───────────────────────────────────────────────────────────────────────────
 
 
 def _register_barrio_font():
@@ -217,19 +232,35 @@ class GifPlayer:
                 canvas.paste(f, (ox, oy), f)
                 self._frames.append(ImageTk.PhotoImage(canvas))
                 delay = frame.info.get("duration", 80)
-                self._delays.append(max(delay, 40))
+                # Speed up non-sleeping gifs by 40% (i.e., multiply delay by 0.6)
+                try:
+                    name = Path(path).name
+                    if name != "sleeping.gif":
+                        delay = int(delay * 0.6)
+                except Exception:
+                    pass
+                self._delays.append(max(int(delay), 40))
         except Exception as e:
             print(f"[GifPlayer] Could not load {path}: {e}")
+
+        # once-play control
+        self._once_counter: int | None = None
+        self._on_once_done = None
 
     def play(self):
         if not self._frames:
             return
         self._running = True
         self._idx = 0
+        # looped play
+        self._once_counter = None
+        self._on_once_done = None
         self._tick()
 
     def stop(self):
         self._running = False
+        self._once_counter = None
+        self._on_once_done = None
         if self._job:
             try:
                 self._label.after_cancel(self._job)
@@ -242,14 +273,56 @@ class GifPlayer:
             return
         self._label.config(image=self._frames[self._idx])
         delay = self._delays[self._idx]
-        self._idx = (self._idx + 1) % len(self._frames)
+        # Advance index and handle once-play behavior
+        self._idx = self._idx + 1
+        if self._once_counter is not None:
+            # counting down frames to play once
+            self._once_counter -= 1
+            if self._once_counter <= 0:
+                # finished a single-play run
+                self._running = False
+                self._job = None
+                cb = self._on_once_done
+                self._on_once_done = None
+                self._once_counter = None
+                if cb:
+                    try:
+                        cb()
+                    except Exception:
+                        pass
+                return
+            else:
+                # continue through frames (no wrap until counter finishes)
+                self._idx = self._idx % len(self._frames)
+                self._job = self._after(delay, self._tick)
+                return
+
+        # normal looping behavior
+        self._idx = self._idx % len(self._frames)
         self._job = self._after(delay, self._tick)
+
+    def play_once(self, on_done=None):
+        """Play the GIF exactly once (all frames) then call on_done()."""
+        if not self._frames:
+            if on_done:
+                try:
+                    on_done()
+                except Exception:
+                    pass
+            return
+        self.stop()
+        self._running = True
+        self._idx = 0
+        self._once_counter = len(self._frames)
+        self._on_once_done = on_done
+        self._tick()
 
 
 class SubtitleRenderer:
     """Typewriter-style subtitles on a Canvas using the Barrio font."""
 
-    CHAR_DELAY = 0.030
+    # Slightly slower typing for a more natural pace
+    CHAR_DELAY = 0.035
 
     def __init__(self, canvas: tk.Canvas, font_size: int = 17, bleep_player=None):
         self._canvas     = canvas
@@ -258,7 +331,7 @@ class SubtitleRenderer:
         self._thread: threading.Thread | None = None
         self._bleep = bleep_player
 
-        self._canvas.config(bg="#0a0a0f")
+        self._canvas.config(bg="#a0a0a0")
         self._font = self._load_font(font_size)
 
     def _load_font(self, size: int) -> tkfont.Font:
@@ -278,7 +351,7 @@ class SubtitleRenderer:
         import re
         texts = re.findall(r'"text"\s*:\s*"([^"]*)', raw_text)
         preview = " ".join(texts).strip() or "…"
-        self._canvas.after(0, lambda p=preview: self._draw(p, color="#555566"))
+        self._canvas.after(0, lambda p=preview: self._draw(p, color="#888899"))
 
     def show_message(self, text: str, color: str = "#ffffff", duration: float = 6.0):
         """Immediately show a static subtitle message (optionally auto-clears)."""
@@ -329,14 +402,20 @@ class SubtitleRenderer:
                 time.sleep(pause)
                 if self._bleep:
                     self._bleep.resume()
+        # Speech finished — stop bleeps immediately so they don't trail into idle state
+        try:
+            if self._bleep:
+                self._bleep.stop()
+        except Exception:
+            pass
         if on_done:
             self._canvas.after(0, on_done)
 
     def _draw(self, text: str, color: str = "#ffffff"):
         cw = self._canvas.winfo_width() or WINDOW_W
-        ch = self._canvas.winfo_height() or 110
+        ch = self._canvas.winfo_height() or 130
         max_w = max(40, cw - 24)
-        max_lines = 4
+        max_lines = 3
         min_font_size = 8
 
         import re
@@ -353,19 +432,18 @@ class SubtitleRenderer:
                     line_chars += needed
             return lines
 
-        # Start at the base font size and shrink until text fits within max_lines
-        font_size = self._font_size
-        font = self._font
         words = text.split()
         if not words:
             self._canvas.delete("all")
             return
 
+        font_size = self._font_size
+        font = self._font
+
         while font_size >= min_font_size:
             char_w = max(4, font_size * 0.62)
             chars_per_line = max(1, int(max_w // char_w))
 
-            # Break long words for this font size
             parts = []
             for w in re.split(r'(\s+)', text):
                 if w.isspace() or not w:
@@ -381,100 +459,119 @@ class SubtitleRenderer:
             if estimate_lines(candidate_words, chars_per_line) <= max_lines:
                 break
 
-            # Doesn't fit — shrink font and retry
             font_size -= 1
             font = self._load_font(font_size)
 
         candidate = " ".join(candidate_words)
         x = cw // 2
 
-        # Single delete + draw — no intermediate redraws
-        self._canvas.delete("all")
-        try:
-            shadow_id = self._canvas.create_text(
-                x + 2, 6 + 2, text=candidate, fill="#000000",
-                font=font, anchor="n", width=max_w, justify="center"
-            )
-            text_id = self._canvas.create_text(
-                x, 6, text=candidate, fill=color,
-                font=font, anchor="n", width=max_w, justify="center"
-            )
-            # Vertically center using bbox (no update_idletasks — avoids forced layout flush)
-            bbox = self._canvas.bbox(text_id)
-            if bbox:
-                height = bbox[3] - bbox[1]
-                y = max(6, (ch - height) // 2)
-                self._canvas.coords(shadow_id, x + 2, y + 2)
-                self._canvas.coords(text_id, x, y)
-        except Exception:
-            pass
+        while font_size >= min_font_size:
+            self._canvas.delete("all")
+            try:
+                shadow_id = self._canvas.create_text(
+                    x + 2, 6 + 2, text=candidate, fill="#000000",
+                    font=font, anchor="n", width=max_w, justify="center"
+                )
+                text_id = self._canvas.create_text(
+                    x, 6, text=candidate, fill=color,
+                    font=font, anchor="n", width=max_w, justify="center"
+                )
+                bbox = self._canvas.bbox(text_id)
+                if bbox:
+                    height = bbox[3] - bbox[1]
+                    if height <= ch - 12:
+                        y = max(6, (ch - height) // 2)
+                        self._canvas.coords(shadow_id, x + 2, y + 2)
+                        self._canvas.coords(text_id, x, y)
+                        break
+                    font_size -= 1
+                    font = self._load_font(font_size)
+                else:
+                    break
+            except Exception:
+                break
 
 
 class AgethaPopup:
-    """Fake Windows-style error popup spawned by Agetha."""
+    """Windows 95-style dialog popup spawned by Agetha."""
 
     def __init__(self, parent: tk.Tk, messages: list, mood: str = "neutral"):
         self._win = tk.Toplevel(parent)
-        # Use default window decorations so the native titlebar (X button) appears
-        try:
-            self._win.title("Agetha.exe")
-        except Exception:
-            pass
-        self._win.resizable(False, False)
+        self._win.overrideredirect(True)   # we draw our own chrome
         self._win.attributes("-topmost", True)
-        self._win.configure(bg="#0a0a0f")
+        self._win.configure(bg=W95_BG)
+        self._win.resizable(False, False)
+        self._drag_x = self._drag_y = 0
 
+        # ── Outer raised bevel ────────────────────────────────────────────
+        outer = tk.Frame(self._win, bg=W95_BG, relief="raised", bd=2)
+        outer.pack(fill="both", expand=True)
 
-        accent = {
-            "angry":     "#8b1a1a",
-            "sad":       "#1a3a6b",
-            "happy":     "#1a6b3a",
-            "excited":   "#7a4a10",
-            "surprised": "#6b5010",
-            "thinking":  "#1a4466",
-            "whisper":   "#3a3a55",
-            "neutral":   "#1e2d3d",
-        }.get(mood, "#1e2d3d")
-
-        # Native title bar (restored)
-        title_bar = tk.Frame(self._win, bg=accent, height=26)
-        title_bar.pack(fill="x")
+        # ── Title bar ─────────────────────────────────────────────────────
+        title_bar = tk.Frame(outer, bg=W95_TITLE_BG, height=18)
+        title_bar.pack(fill="x", padx=2, pady=(2, 0))
         title_bar.pack_propagate(False)
+
         tk.Label(
             title_bar, text="⚠  Agetha.exe",
-            bg=accent, fg="#ccccdd",
-            font=("Courier", 9, "bold"),
-            anchor="w", padx=8,
+            bg=W95_TITLE_BG, fg=W95_TITLE_FG,
+            font=W95_FONT_BOLD, anchor="w", padx=4,
         ).pack(side="left", fill="y")
 
-        body = tk.Frame(self._win, bg="#0a0a0f", padx=18, pady=14)
-        body.pack(fill="both", expand=True)
+        close_btn = tk.Button(
+            title_bar, text="✕",
+            bg=W95_BTN_BG, fg=W95_TEXT,
+            font=("MS Sans Serif", 7, "bold"),
+            relief="raised", bd=2, width=2,
+            activebackground=W95_BTN_BG, activeforeground=W95_TEXT,
+            command=self._win.destroy,
+        )
+        close_btn.pack(side="right", padx=2, pady=1)
 
-        tk.Label(body, text="⚠", fg="#cc9900", bg="#0a0a0f",
-                 font=("Courier", 26)).grid(row=0, column=0,
-                 rowspan=max(len(messages), 1) + 1, sticky="n", padx=(0, 14))
+        # bind drag on title bar and its label child
+        for w in (title_bar,) + tuple(title_bar.winfo_children()):
+            if not isinstance(w, tk.Button):
+                w.bind("<ButtonPress-1>", self._drag_start)
+                w.bind("<B1-Motion>",     self._drag_motion)
+
+        # ── Body ──────────────────────────────────────────────────────────
+        body = tk.Frame(outer, bg=W95_BG, padx=12, pady=10)
+        body.pack(fill="both", expand=True, padx=2)
+
+        icon_frame = tk.Frame(body, bg=W95_BG, bd=2, relief="sunken",
+                              width=36, height=36)
+        icon_frame.grid(row=0, column=0,
+                        rowspan=max(len(messages), 1) + 1,
+                        sticky="n", padx=(0, 12), pady=2)
+        icon_frame.pack_propagate(False)
+        tk.Label(icon_frame, text="⚠", fg="#ff8000", bg=W95_BG,
+                 font=("MS Sans Serif", 16, "bold")).pack(expand=True)
 
         for i, msg in enumerate(messages):
             tk.Label(
                 body, text=msg,
-                fg="#ccccdd", bg="#0a0a0f",
-                font=("Courier", 10),
-                wraplength=270, justify="left", anchor="w",
-            ).grid(row=i, column=1, sticky="w", pady=2)
+                fg=W95_TEXT, bg=W95_BG,
+                font=W95_FONT,
+                wraplength=240, justify="left", anchor="w",
+            ).grid(row=i, column=1, sticky="w", pady=1)
 
-        tk.Frame(self._win, bg=accent, height=1).pack(fill="x", pady=(4, 0))
+        # ── Separator ─────────────────────────────────────────────────────
+        tk.Frame(outer, bg=W95_SHADOW, height=1).pack(fill="x", padx=2, pady=(4, 0))
+        tk.Frame(outer, bg="#ffffff",  height=1).pack(fill="x", padx=2)
 
-        btn_row = tk.Frame(self._win, bg="#0a0a0f", pady=8)
+        # ── OK button ─────────────────────────────────────────────────────
+        btn_row = tk.Frame(outer, bg=W95_BG, pady=6)
         btn_row.pack(fill="x")
         tk.Button(
-            btn_row, text="[  OK  ]",
-            font=("Courier", 10, "bold"),
-            bg=accent, fg="#ccccdd",
-            activebackground="#556677", activeforeground="#ffffff",
-            relief="flat", bd=0, padx=16, pady=4,
+            btn_row, text="OK",
+            font=W95_FONT_BOLD,
+            bg=W95_BTN_BG, fg=W95_TEXT,
+            activebackground=W95_BTN_ACT, activeforeground=W95_BTN_AFG,
+            relief="raised", bd=2, width=8, pady=2,
             command=self._win.destroy,
         ).pack()
 
+        # ── Position just above the parent window ─────────────────────────
         self._win.update_idletasks()
         px = parent.winfo_x()
         py = parent.winfo_y()
@@ -489,13 +586,14 @@ class AgethaPopup:
         self._win.bind("<Escape>", lambda _: self._win.destroy())
         self._win.focus_force()
 
-    def _on_drag_start(self, event):
-        # removed: drag handling not needed with native titlebar
-        return
+    def _drag_start(self, event):
+        self._drag_x, self._drag_y = event.x_root, event.y_root
 
-    def _on_drag_motion(self, event):
-        # removed: drag handling not needed with native titlebar
-        return
+    def _drag_motion(self, event):
+        dx = event.x_root - self._drag_x
+        dy = event.y_root - self._drag_y
+        self._win.geometry(f"+{self._win.winfo_x()+dx}+{self._win.winfo_y()+dy}")
+        self._drag_x, self._drag_y = event.x_root, event.y_root
 
 
 class CompanionApp:
@@ -518,6 +616,14 @@ class CompanionApp:
         "loaf":      "loaf.gif",
     }
 
+    # Static images to show after animated emotion gifs finish
+    EXTRA_STATIC_GIFS = {
+        "happy": "happy-static.gif",
+        "sad":   "sad-static.gif",
+        "angry": "angry-static.gif",
+        "thinking": "thinking-static.gif",
+    }
+
     def __init__(self):
         # Register font before creating the Tk window so families() sees it
         _register_barrio_font()
@@ -525,8 +631,9 @@ class CompanionApp:
         self.root = tk.Tk()
         self.root.title("Agetha.exe")
         self.root.geometry(f"{WINDOW_W}x{WINDOW_H}+80+80")
-        self.root.configure(bg="#0a0a0f")
-        self.root.resizable(False, False)
+        self.root.configure(bg=W95_BG)
+        self.root.overrideredirect(True)
+        self.root.resizable(True, True)
         self.root.attributes("-topmost", True)
 
         self._state      = self.STATE_SLEEPING
@@ -536,71 +643,177 @@ class CompanionApp:
         self._poll_job = None
         self._persistent_mood: str | None = None  # holds sad/angry across speech→idle
 
-        self._bleep  = BleepPlayer()
-        self._screen = ScreenReader()
-        self._ai     = AIEngine()
+        # Defer heavy initialization to background thread so the window shows immediately
+        self._bleep  = None
+        self._screen = None
+        self._ai     = None
         self._last_screen_text: str = ""
         self._loaf_job = None
         self._is_loafing = False
+        self._pending_shutdown = False
 
         self._build_ui()
-        self._preload_gifs()
-        self._start_wake_sequence()
 
-        self.root.bind("<ButtonPress-1>", self._drag_start)
-        self.root.bind("<B1-Motion>",     self._drag_motion)
+        # Show an immediate loading label so the user sees feedback before any GIFs load.
+        # This is a plain tk.Label placed over the gif area — no after() scheduling needed,
+        # so it appears on the very first frame before background init even starts.
+        self._loading_label = tk.Label(
+            self._outer,
+            text="Loading Agetha and their assets…",
+            fg="#555555", bg=W95_BG,
+            font=W95_FONT,
+            wraplength=WINDOW_W - 40,
+            justify="center",
+        )
+        # Place it to fully cover the gif + subtitle area so the black bg is hidden
+        self._loading_label.place(x=0, y=20, relwidth=1.0, relheight=1.0)
+
+        # Force update so the window and loading label become visible immediately
+        try:
+            self.root.update()
+        except Exception:
+            pass
+
+        # Start background init (audio, screen reader, AI); UI-related work (preloading GIFs)
+        # will be scheduled back on the main thread when ready.
+        threading.Thread(target=self._init_background, daemon=True).start()
+
         self._drag_x = self._drag_y = 0
+        self._is_minimized = False
 
     def _build_ui(self):
-        self._gif_label = tk.Label(self.root, bg="#0a0a0f", bd=0,
-                                   width=GIF_W, height=GIF_H)
-        self._gif_label.pack(pady=0)
+        # ── Outer raised bevel (whole window border) ──────────────────────────
+        self._outer = tk.Frame(self.root, bg=W95_BG, relief="raised", bd=2)
+        self._outer.pack(fill="both", expand=True)
 
-        status_frame = tk.Frame(self.root, bg="#0a0a0f")
-        status_frame.pack(fill="x", padx=10)
+        # ── Win95 Title bar ───────────────────────────────────────────────────
+        title_bar = tk.Frame(self._outer, bg=W95_TITLE_BG, height=18)
+        title_bar.pack(fill="x", padx=2, pady=(2, 0))
+        title_bar.pack_propagate(False)
+
+        # App icon + title
+        title_lbl = tk.Label(
+            title_bar, text="🖥  Agetha.exe",
+            bg=W95_TITLE_BG, fg=W95_TITLE_FG,
+            font=W95_FONT_BOLD, anchor="w", padx=4,
+        )
+        title_lbl.pack(side="left", fill="y")
+
+        # Close button
+        close_btn = tk.Button(
+            title_bar, text="✕",
+            bg=W95_BTN_BG, fg=W95_TEXT,
+            font=("MS Sans Serif", 7, "bold"),
+            relief="raised", bd=2, width=2,
+            activebackground=W95_BTN_BG, activeforeground=W95_TEXT,
+            command=self.root.quit,
+        )
+        close_btn.pack(side="right", padx=(0, 2), pady=1)
+
+        # Maximize button (no-op visual)
+        max_btn = tk.Button(
+            title_bar, text="□",
+            bg=W95_BTN_BG, fg=W95_TEXT,
+            font=("MS Sans Serif", 7, "bold"),
+            relief="raised", bd=2, width=2,
+            activebackground=W95_BTN_BG, activeforeground=W95_TEXT,
+            command=lambda: None,
+        )
+        max_btn.pack(side="right", padx=(0, 1), pady=1)
+
+        # Minimize button
+        min_btn = tk.Button(
+            title_bar, text="─",
+            bg=W95_BTN_BG, fg=W95_TEXT,
+            font=("MS Sans Serif", 7, "bold"),
+            relief="raised", bd=2, width=2,
+            activebackground=W95_BTN_BG, activeforeground=W95_TEXT,
+            command=self._minimize,
+        )
+        min_btn.pack(side="right", padx=(0, 1), pady=1)
+
+        # Drag bindings on title bar and its non-button children
+        for w in (title_bar, title_lbl):
+            w.bind("<ButtonPress-1>", self._drag_start)
+            w.bind("<B1-Motion>",     self._drag_motion)
+
+
+        # ── GIF display area — black background, raised border ───────────────
+        gif_border = tk.Frame(self._outer, bg="#000000", relief="raised", bd=2)
+        gif_border.pack(fill="x", padx=4, pady=(4, 0))
+
+        self._gif_label = tk.Label(gif_border, bg="#000000", bd=0,
+                                   width=GIF_W, height=GIF_H)
+        self._gif_label.pack()
+
+        # ── Status bar ────────────────────────────────────────────────────────
+        status_frame = tk.Frame(self._outer, bg=W95_BG, bd=1, relief="sunken")
+        status_frame.pack(fill="x", padx=4, pady=(2, 0))
         self._status_var = tk.StringVar(value="zzz…")
         tk.Label(status_frame, textvariable=self._status_var,
-             fg="#555566", bg="#0a0a0f",
-             font=("Courier", 10)).pack(side="left", padx=4)
+                 fg=W95_SHADOW, bg=W95_BG,
+                 font=W95_FONT, anchor="w").pack(side="left", padx=4, pady=1)
 
-        self._sub_canvas = tk.Canvas(self.root, width=WINDOW_W, height=110,
-                                     bg="#0a0a0f", bd=0, highlightthickness=0)
-        self._sub_canvas.pack(fill="x", pady=(4, 4))
-        self._subtitle = SubtitleRenderer(self._sub_canvas, font_size=17, bleep_player=self._bleep)
+        # ── Subtitle canvas — dark gray, no border ────────────────────────────
+        self._sub_canvas = tk.Canvas(self._outer, width=WINDOW_W, height=130,
+                                     bg="#a0a0a0", bd=2, relief="sunken",
+                                     highlightthickness=0)
+        self._sub_canvas.pack(fill="x", padx=4, pady=(4, 0))
+        self._subtitle = SubtitleRenderer(self._sub_canvas, font_size=17,
+                                          bleep_player=self._bleep)
 
-        input_frame = tk.Frame(self.root, bg="#0a0a0f")
-        input_frame.pack(fill="x", padx=10, pady=(0, 8))
+        # ── Input row — Win95 style ───────────────────────────────────────────
+        input_frame = tk.Frame(self._outer, bg=W95_BG)
+        input_frame.pack(fill="x", padx=4, pady=(6, 8))
 
-        self._input_var = tk.StringVar()
-        # Prefer Barrio font if available (registered earlier), fall back to Courier
         families = tkfont.families()
         if "Barrio" in families:
             input_font = tkfont.Font(family="Barrio", size=11)
-            btn_font = tkfont.Font(family="Barrio", size=12, weight="bold")
         else:
-            input_font = tkfont.Font(family="Courier", size=11)
-            btn_font = tkfont.Font(family="Courier", size=12, weight="bold")
+            input_font = tkfont.Font(family="MS Sans Serif", size=8)
 
+        self._input_var = tk.StringVar()
         self._input_box = tk.Entry(
             input_frame,
             textvariable=self._input_var,
             font=input_font,
-            bg="#1a1a2e", fg="#ccccdd",
-            insertbackground="#ccccdd",
-            relief="flat", bd=4,
+            bg=W95_INPUT_BG, fg=W95_TEXT,
+            insertbackground=W95_TEXT,
+            relief="sunken", bd=2,
         )
-        self._input_box.pack(side="left", fill="x", expand=True, ipady=4)
+        self._input_box.pack(side="left", fill="x", expand=True, ipady=6)
         self._input_box.bind("<Return>", self._on_user_input)
 
-        # No separate send button: pressing Enter sends the message
+        tk.Button(
+            input_frame, text="OK",
+            font=W95_FONT_BOLD,
+            bg=W95_BTN_BG, fg=W95_TEXT,
+            activebackground=W95_BTN_ACT, activeforeground=W95_BTN_AFG,
+            relief="raised", bd=2, padx=10, pady=5,
+            command=self._on_user_input,
+        ).pack(side="left", padx=(4, 0))
 
     def _drag_start(self, e):
-        self._drag_x, self._drag_y = e.x, e.y
+        self._drag_x, self._drag_y = e.x_root, e.y_root
 
     def _drag_motion(self, e):
-        x = self.root.winfo_x() + (e.x - self._drag_x)
-        y = self.root.winfo_y() + (e.y - self._drag_y)
-        self.root.geometry(f"+{x}+{y}")
+        dx = e.x_root - self._drag_x
+        dy = e.y_root - self._drag_y
+        self.root.geometry(f"+{self.root.winfo_x()+dx}+{self.root.winfo_y()+dy}")
+        self._drag_x, self._drag_y = e.x_root, e.y_root
+
+    def _minimize(self):
+        """Minimize the overrideredirect window via the iconify trick."""
+        self.root.overrideredirect(False)
+        self.root.iconify()
+        def _bind_restore():
+            def _on_map(event):
+                if self.root.state() != "iconic":
+                    self.root.overrideredirect(True)
+                    self.root.attributes("-topmost", True)
+                    self.root.unbind("<Map>")
+            self.root.bind("<Map>", _on_map)
+        self.root.after(200, _bind_restore)
 
     def _on_user_input(self, event=None):
         text = self._input_var.get().strip()
@@ -619,12 +832,72 @@ class CompanionApp:
         self._input_box.focus_set()
 
     def _preload_gifs(self):
-        for name in self.IDLE_GIFS + self.TALKING_GIFS + list(self.EXTRA_GIFS.values()):
+        # preload both animated emotion gifs and their static counterparts (if present)
+        static_vals = list(self.EXTRA_STATIC_GIFS.values()) if getattr(self, 'EXTRA_STATIC_GIFS', None) else []
+        for name in self.IDLE_GIFS + self.TALKING_GIFS + list(self.EXTRA_GIFS.values()) + static_vals:
             path = ASSETS / name
             if path.exists():
                 self._gif_cache[name] = GifPlayer(self._gif_label, str(path), self.root.after)
             else:
                 print(f"[WARN] Missing asset: {path}")
+
+    def _init_background(self):
+        """Run heavy initialization off the main thread."""
+        try:
+            bleep = None
+            screen = None
+            ai = None
+            try:
+                bleep = BleepPlayer()
+            except Exception as e:
+                print(f"[BackgroundInit] Bleep init failed: {e}")
+            try:
+                screen = ScreenReader()
+            except Exception as e:
+                print(f"[BackgroundInit] ScreenReader init failed: {e}")
+            try:
+                ai = AIEngine()
+            except Exception as e:
+                print(f"[BackgroundInit] AIEngine init failed: {e}")
+
+            # Apply the results on the main thread (UI-safe operations there)
+            def _finish():
+                try:
+                    self._bleep = bleep
+                    self._screen = screen
+                    self._ai = ai
+                    # Attach bleep to subtitle renderer
+                    try:
+                        if hasattr(self, "_subtitle") and self._subtitle:
+                            self._subtitle._bleep = self._bleep
+                    except Exception:
+                        pass
+                    # Remove the loading label now that assets are about to appear
+                    try:
+                        if hasattr(self, "_loading_label") and self._loading_label:
+                            self._loading_label.destroy()
+                            self._loading_label = None
+                    except Exception:
+                        pass
+                    # Preload gifs (must run on main thread because ImageTk uses Tk)
+                    try:
+                        self._preload_gifs()
+                    except Exception as e:
+                        print(f"[BackgroundInit] preload_gifs failed: {e}")
+                    # Start wake sequence once resources are ready
+                    try:
+                        self._start_wake_sequence()
+                    except Exception as e:
+                        print(f"[BackgroundInit] start_wake_sequence failed: {e}")
+                except Exception:
+                    pass
+
+            try:
+                self.root.after(0, _finish)
+            except Exception:
+                _finish()
+        except Exception as e:
+            print(f"[BackgroundInit] Unexpected error: {e}")
 
     def _play_gif(self, name: str):
         if self._current_gif_player:
@@ -635,6 +908,41 @@ class CompanionApp:
             player.play()
         else:
             print(f"[WARN] GIF not loaded: {name}")
+
+    def _play_gif_once_then(self, anim_name: str, static_name: str, guard=None):
+        """Play anim_name once, then switch to static_name (if guard passes)."""
+        player = self._gif_cache.get(anim_name)
+        static = self._gif_cache.get(static_name)
+        if not player:
+            return
+        if self._current_gif_player and self._current_gif_player is not player:
+            self._current_gif_player.stop()
+        self._current_gif_player = player
+        def _done():
+            if guard is None or guard():
+                if static:
+                    if self._current_gif_player:
+                        self._current_gif_player.stop()
+                    self._current_gif_player = static
+                    static.play()
+        player.play_once(lambda: self.root.after(0, _done))
+
+    def _play_gif_once_then_loop(self, anim_name: str, mood: str):
+        """Play anim_name once, then loop it for as long as state is TALKING."""
+        player = self._gif_cache.get(anim_name)
+        if not player:
+            self._start_talking_rotation()
+            return
+        if self._current_gif_player and self._current_gif_player is not player:
+            self._current_gif_player.stop()
+        self._current_gif_player = player
+        def _done():
+            if self._state == self.STATE_TALKING and self._persistent_mood == mood:
+                if self._current_gif_player:
+                    self._current_gif_player.stop()
+                self._current_gif_player = player
+                player.play()
+        player.play_once(lambda: self.root.after(0, _done))
 
     def _start_talking_rotation(self):
         self._rotate_talking()
@@ -678,40 +986,63 @@ class CompanionApp:
         self._status_var.set(labels.get(state, state))
 
         self._stop_talking_rotation()
-        self._bleep.stop()
+        if self._bleep:
+            try:
+                self._bleep.stop()
+            except Exception:
+                pass
 
         # Moods that should linger after speech ends (until next response or explicit idle)
-        _STICKY_MOODS = {"sad", "angry"}
+        # Make 'happy' and 'thinking' sticky as well per user preference
+        _STICKY_MOODS = {"sad", "angry", "happy", "thinking"}
 
         if state == self.STATE_SLEEPING:
             self._persistent_mood = None
             self._play_gif("sleeping.gif")
         elif state == self.STATE_THINKING:
-            self._play_gif("thinking.gif")
+            self._persistent_mood = None
+            self._play_gif_once_then("thinking.gif", "thinking-static.gif",
+                                     guard=lambda: self._state == self.STATE_THINKING)
         elif state == self.STATE_IDLE:
             # If we have a sticky mood carry it forward; a new response will clear it
             effective_mood = self._persistent_mood if self._persistent_mood else mood
-            mood_gif = self.EXTRA_GIFS.get(effective_mood)
-            if mood_gif and mood_gif in self._gif_cache:
-                self._play_gif(mood_gif)
+            # Prefer static emotion image after animated playback
+            static_name = None
+            try:
+                static_name = self.EXTRA_STATIC_GIFS.get(effective_mood)
+            except Exception:
+                static_name = None
+
+            if static_name and static_name in self._gif_cache:
+                self._play_gif(static_name)
             else:
-                available = [g for g in self.IDLE_GIFS if g in self._gif_cache]
-                if available:
-                    self._play_gif(random.choice(available))
+                mood_gif = self.EXTRA_GIFS.get(effective_mood)
+                if mood_gif and mood_gif in self._gif_cache:
+                    self._play_gif(mood_gif)
+                else:
+                    available = [g for g in self.IDLE_GIFS if g in self._gif_cache]
+                    if available:
+                        self._play_gif(random.choice(available))
             # Schedule loaf.gif after 15 minutes of idle
             try:
                 self._loaf_job = self.root.after(15 * 60 * 1000, self._enter_loaf)
             except Exception:
                 self._loaf_job = None
         elif state == self.STATE_TALKING:
-            # Record sticky mood when Agetha starts talking in a strong mood
             if mood in _STICKY_MOODS:
                 self._persistent_mood = mood
             else:
                 self._persistent_mood = None
             mood_gif = self.EXTRA_GIFS.get(mood)
-            if mood_gif and mood_gif in self._gif_cache and mood != "neutral":
-                self._play_gif(mood_gif)
+            static_name = self.EXTRA_STATIC_GIFS.get(mood)
+            if mood != "neutral" and mood_gif and mood_gif in self._gif_cache:
+                if static_name and static_name in self._gif_cache:
+                    # Play emotion gif once, then loop it until speech ends
+                    self._talking_emotion_looping = False
+                    self._play_gif_once_then_loop(mood_gif, mood)
+                else:
+                    # No static — just loop the emotion gif
+                    self._play_gif(mood_gif)
             else:
                 self._start_talking_rotation()
             self._bleep.start_talking(tone=mood)
@@ -727,7 +1058,7 @@ class CompanionApp:
 
     def _start_wake_sequence(self):
         self._set_state(self.STATE_SLEEPING)
-        self.root.after(3500, self._finish_wake)
+        self.root.after(8000, self._finish_wake)
 
     def _finish_wake(self):
         self._set_state(self.STATE_IDLE, "neutral")
@@ -775,6 +1106,11 @@ class CompanionApp:
         self._dispatch_response(response, user_message)
 
     def _dispatch_response(self, response: dict, user_message: str | None = None):
+        # Clear any temporary loading subtitle when handling a response
+        try:
+            self.root.after(0, lambda: self._subtitle.clear())
+        except Exception:
+            pass
         command  = response.get("command", "idle")
         mood     = response.get("mood", "neutral")
         segments = response.get("segments", [])
@@ -798,6 +1134,34 @@ class CompanionApp:
             else:
                 self.root.after(0, lambda: self._set_state(self.STATE_IDLE, resp_mood))
                 self._reschedule_screen_poll()
+
+        # Short-response static gif handling: if AI speaks a very short excited/happy/surprised
+        # message (single short segment), show the static emotion gif during speech instead of
+        # playing the full animated version.
+        try:
+            short_moods = {"happy", "excited", "surprised"}
+            is_short = (
+                command == "speak" and isinstance(segments, list) and len(segments) == 1 and
+                isinstance(segments[0].get("text", ""), str) and len(segments[0].get("text", "").split()) <= 6
+            )
+            if is_short and mood in short_moods:
+                static_name = (self.EXTRA_STATIC_GIFS.get(mood) if getattr(self, 'EXTRA_STATIC_GIFS', None) else None)
+                if not static_name and mood in ("excited", "surprised"):
+                    # fallback to happy static if a mood-specific static gif isn't present
+                    static_name = (self.EXTRA_STATIC_GIFS.get("happy") if getattr(self, 'EXTRA_STATIC_GIFS', None) else None)
+                # If we have a static image, show it while speaking
+                if static_name and static_name in self._gif_cache:
+                    self.root.after(0, lambda: self._set_state(self.STATE_TALKING, mood))
+                    # small delay to let _set_state run, then force the static image
+                    self.root.after(12, lambda: self._play_gif(static_name))
+                    # speak as normal (subtitle will clear loading text earlier)
+                    self.root.after(0, lambda: self._subtitle.speak(
+                        segments,
+                        on_done=lambda: self._on_speech_done(shutdown_requested)
+                    ))
+                    return
+        except Exception:
+            pass
 
         # --- New: show_error_gif handling (display gif indefinitely) ---
         if command == "show_error_gif":
@@ -1177,6 +1541,11 @@ class CompanionApp:
                 on_done=lambda: self._on_speech_done(shutdown_requested)
             ))
         elif command == "speak" and segments:
+            # Clear any loading subtitle immediately as we begin speaking
+            try:
+                self.root.after(0, lambda: self._subtitle.clear())
+            except Exception:
+                pass
             self.root.after(0, lambda: self._set_state(self.STATE_TALKING, mood))
             self.root.after(0, lambda: self._subtitle.speak(
                 segments,
@@ -1189,7 +1558,7 @@ class CompanionApp:
             self._reschedule_screen_poll()
 
     def _on_speech_done(self, shutdown: bool = False):
-        # Keep _persistent_mood — _set_state(STATE_IDLE) will pick it up
+        # _persistent_mood already set — _set_state(STATE_IDLE) picks it up
         self.root.after(0, lambda: self._set_state(self.STATE_IDLE))
         if shutdown:
             self.root.after(50, self._shutdown)
@@ -1228,7 +1597,7 @@ def _early_config_check():
     if config_path.exists():
         return  # Nothing to do
 
-    default_config = """# Agetha version 3.2.2 config file, @tomiszivacs on TikTok
+    default_config = """# Agetha version 4.0 config file, @tomiszivacs on TikTok
     
     # Set to "yes" to use a local AI model via Ollama instead of Groq. Make sure to set LOCAL_AI_MODEL if enabling.
     USE_LOCAL_AI = no
