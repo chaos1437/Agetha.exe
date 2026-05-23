@@ -29,6 +29,29 @@ BASE_DIR = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Pat
 ASSETS      = BASE_DIR / "assets"
 FONT_PATH   = ASSETS / "barrio.ttf"
 
+
+def native_error_popup(title: str, message: str) -> None:
+    """Show a native OS error dialog — same style as the first-run config popup.
+    Uses Windows MessageBoxW (MB_ICONERROR | MB_TOPMOST) with a tkinter showerror fallback."""
+    print(f"[ERROR] {title}: {message}")
+    try:
+        import ctypes
+        # 0x10 = MB_ICONERROR, 0x1000 = MB_TOPMOST
+        ctypes.windll.user32.MessageBoxW(0, message, title, 0x10 | 0x1000)
+        return
+    except Exception:
+        pass
+    try:
+        import tkinter as _tk
+        from tkinter import messagebox as _mb
+        _r = _tk.Tk()
+        _r.withdraw()
+        _r.attributes("-topmost", True)
+        _mb.showerror(title, message, parent=_r)
+        _r.destroy()
+    except Exception:
+        pass
+
 WINDOW_W = 340
 WINDOW_H = 560
 GIF_W    = 340
@@ -48,6 +71,21 @@ BLEEP_TONES = {
 }
 
 
+def _safe_win_font(size: int = 8, bold: bool = False) -> tuple:
+    """Return a font tuple that renders correctly on Win10, Win11, Server, and LTSC.
+    Tries MS Sans Serif first (Win95 look), falls back to Segoe UI, then TkDefaultFont."""
+    weight = "bold" if bold else "normal"
+    # MS Sans Serif ships with Windows but may be absent on some Server/LTSC installs.
+    # Segoe UI is the modern fallback; Arial is the last resort.
+    for family in ("MS Sans Serif", "Segoe UI", "Arial", "TkDefaultFont"):
+        try:
+            tkfont.Font(family=family, size=size, weight=weight)
+            return (family, size, weight) if bold else (family, size)
+        except Exception:
+            continue
+    return ("TkDefaultFont", size)
+
+
 # ── Windows 95 colour palette ──────────────────────────────────────────────
 W95_BG        = "#c0c0c0"
 W95_TITLE_BG  = "#000080"
@@ -60,6 +98,8 @@ W95_BTN_ACT   = "#000080"
 W95_BTN_AFG   = "#ffffff"
 W95_FONT      = ("MS Sans Serif", 8)
 W95_FONT_BOLD = ("MS Sans Serif", 8, "bold")
+# Note: Tk uses the first available font in the family name; if MS Sans Serif is missing
+# on a given Windows install, _build_ui() patches these at runtime via _safe_win_font().
 # ───────────────────────────────────────────────────────────────────────────
 
 
@@ -207,45 +247,87 @@ class BleepPlayer:
             self._thread.join(timeout=0.4)
 
 
+def _read_animation_speed() -> float:
+    """Read ANIMATION_SPEED from config.txt once at startup. Returns 0.6 if missing/invalid."""
+    try:
+        _base = Path(sys.argv[0]).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).parent
+        _cfg = _base / "config.txt"
+        if _cfg.exists():
+            for ln in _cfg.read_text(encoding="utf-8", errors="replace").splitlines():
+                s = ln.strip()
+                if s.startswith("#") or "=" not in s:
+                    continue
+                k, v = s.split("=", 1)
+                if k.strip().upper() == "ANIMATION_SPEED":
+                    return float(v.strip())
+    except Exception:
+        pass
+    return 0.6
+
+# Read once at import time so GifPlayer doesn't re-read config per frame
+_ANIMATION_SPEED = _read_animation_speed()
+
+
+def _load_gif_frames_offthread(path: str) -> tuple[list[Image.Image], list[int]]:
+    """Do all heavy PIL work (open, convert, resize, composite) off the main thread.
+    Returns (pil_images, delays) — no ImageTk objects yet, those need the main thread."""
+    pil_frames: list[Image.Image] = []
+    delays: list[int] = []
+    is_sleeping = Path(path).name == "sleeping.gif"
+    speed = 1.0 if is_sleeping else _ANIMATION_SPEED
+    try:
+        img = Image.open(path)
+        for frame in ImageSequence.Iterator(img):
+            f = frame.convert("RGBA")
+            f.thumbnail((GIF_W, GIF_H), Image.LANCZOS)
+            canvas = Image.new("RGBA", (GIF_W, GIF_H), (10, 10, 15, 255))
+            ox = (GIF_W - f.width) // 2
+            oy = (GIF_H - f.height) // 2
+            canvas.paste(f, (ox, oy), f)
+            pil_frames.append(canvas)
+            delay = frame.info.get("duration", 80)
+            delays.append(max(int(delay * speed), 40))
+    except Exception as e:
+        print(f"[GifPlayer] Could not load {path}: {e}")
+    return pil_frames, delays
+
+
 class GifPlayer:
-    """Loads and animates a GIF on a tk.Label, looping automatically."""
+    """Loads and animates a GIF on a tk.Label, looping automatically.
 
-    def __init__(self, label: tk.Label, gif_path: str, after_cb):
-        self._label  = label
-        self._after  = after_cb
+    PIL work (open/convert/resize/composite) is done off the main thread in
+    _load_gif_frames_offthread(). Only ImageTk.PhotoImage creation — which
+    requires Tk to be alive — happens on the main thread, and it's fast.
+    """
+
+    def __init__(self, label: tk.Label, gif_path: str, after_cb,
+                 pil_frames: list | None = None, delays: list | None = None):
+        self._label   = label
+        self._after   = after_cb
         self._frames: list[ImageTk.PhotoImage] = []
-        self._delays: list[int] = []
-        self._idx    = 0
-        self._job    = None
+        self._delays: list[int] = delays or []
+        self._idx     = 0
+        self._job     = None
         self._running = False
-        self._load(gif_path)
-
-    def _load(self, path: str):
-        try:
-            img = Image.open(path)
-            for frame in ImageSequence.Iterator(img):
-                f = frame.convert("RGBA")
-                f.thumbnail((GIF_W, GIF_H), Image.LANCZOS)
-                canvas = Image.new("RGBA", (GIF_W, GIF_H), (10, 10, 15, 255))
-                ox = (GIF_W - f.width)  // 2
-                oy = (GIF_H - f.height) // 2
-                canvas.paste(f, (ox, oy), f)
-                self._frames.append(ImageTk.PhotoImage(canvas))
-                delay = frame.info.get("duration", 80)
-                # Speed up non-sleeping gifs by 40% (i.e., multiply delay by 0.6)
-                try:
-                    name = Path(path).name
-                    if name != "sleeping.gif":
-                        delay = int(delay * 0.6)
-                except Exception:
-                    pass
-                self._delays.append(max(int(delay), 40))
-        except Exception as e:
-            print(f"[GifPlayer] Could not load {path}: {e}")
-
         # once-play control
         self._once_counter: int | None = None
         self._on_once_done = None
+
+        if pil_frames is not None:
+            # Fast path: PIL work already done, just convert to ImageTk on main thread
+            for pil_img in pil_frames:
+                try:
+                    self._frames.append(ImageTk.PhotoImage(pil_img))
+                except Exception as e:
+                    print(f"[GifPlayer] ImageTk conversion failed for {gif_path}: {e}")
+        else:
+            # Slow/legacy path: load synchronously (only used if called without pre-loading)
+            pil_frames, self._delays = _load_gif_frames_offthread(gif_path)
+            for pil_img in pil_frames:
+                try:
+                    self._frames.append(ImageTk.PhotoImage(pil_img))
+                except Exception as e:
+                    print(f"[GifPlayer] ImageTk conversion failed for {gif_path}: {e}")
 
     def play(self):
         if not self._frames:
@@ -584,7 +666,10 @@ class AgethaPopup:
 
         self._win.bind("<Return>", lambda _: self._win.destroy())
         self._win.bind("<Escape>", lambda _: self._win.destroy())
-        self._win.focus_force()
+        try:
+            self._win.focus_force()
+        except Exception:
+            pass
 
     def _drag_start(self, event):
         self._drag_x, self._drag_y = event.x_root, event.y_root
@@ -625,6 +710,24 @@ class CompanionApp:
     }
 
     def __init__(self):
+        # Enable Per-Monitor DPI awareness before creating the Tk window.
+        # Without this, Windows scales the window up with bicubic interpolation
+        # making everything blurry on 125%/150%/200% displays (common on Win10/11).
+        # We try the v2 API (Win10 1703+) first, fall back to v1 (Win8.1+), then
+        # the legacy SetProcessDPIAware (Vista+). All calls are no-ops on non-Windows.
+        try:
+            import ctypes
+            _shcore = ctypes.windll.shcore
+            try:
+                _shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE_V2
+            except Exception:
+                try:
+                    _shcore.SetProcessDpiAwareness(1)  # PROCESS_SYSTEM_DPI_AWARE
+                except Exception:
+                    ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
         # Register font before creating the Tk window so families() sees it
         _register_barrio_font()
 
@@ -633,7 +736,7 @@ class CompanionApp:
         self.root.geometry(f"{WINDOW_W}x{WINDOW_H}+80+80")
         self.root.configure(bg=W95_BG)
         self.root.overrideredirect(True)
-        self.root.resizable(True, True)
+        self.root.resizable(False, False)
         self.root.attributes("-topmost", True)
 
         self._state      = self.STATE_SLEEPING
@@ -654,22 +757,111 @@ class CompanionApp:
 
         self._build_ui()
 
-        # Show an immediate loading label so the user sees feedback before any GIFs load.
-        # This is a plain tk.Label placed over the gif area — no after() scheduling needed,
-        # so it appears on the very first frame before background init even starts.
-        self._loading_label = tk.Label(
-            self._outer,
-            text="Loading Agetha and their assets…",
-            fg="#555555", bg=W95_BG,
-            font=W95_FONT,
-            wraplength=WINDOW_W - 40,
-            justify="center",
-        )
-        # Place it to fully cover the gif + subtitle area so the black bg is hidden
+        # Show a Win95-style progress bar that covers the gif + subtitle area.
+        # Built from plain tk widgets — no ttk — to match the existing W95 aesthetic.
+        self._loading_label = tk.Frame(self._outer, bg=W95_BG)
         self._loading_label.place(x=0, y=20, relwidth=1.0, relheight=1.0)
 
-        # Force update so the window and loading label become visible immediately
+        # Title text
+        tk.Label(
+            self._loading_label,
+            text="Loading Agetha.exe",
+            fg=W95_TEXT, bg=W95_BG,
+            font=W95_FONT_BOLD,
+        ).pack(pady=(40, 4))
+
+        # Status message (updated as each step completes)
+        self._load_status_var = tk.StringVar(value="Initializing…")
+        tk.Label(
+            self._loading_label,
+            textvariable=self._load_status_var,
+            fg=W95_SHADOW, bg=W95_BG,
+            font=W95_FONT,
+        ).pack(pady=(0, 8))
+
+        # Win95 progress bar: sunken outer frame, filled inner canvas
+        _pb_outer = tk.Frame(
+            self._loading_label,
+            bg=W95_BG, relief="sunken", bd=2,
+            width=WINDOW_W - 60, height=20,
+        )
+        _pb_outer.pack(pady=(0, 4))
+        _pb_outer.pack_propagate(False)
+
+        self._pb_canvas = tk.Canvas(
+            _pb_outer, bg=W95_INPUT_BG,
+            highlightthickness=0, bd=0,
+        )
+        self._pb_canvas.pack(fill="both", expand=True)
+
+        # Percentage label below the bar
+        self._load_pct_var = tk.StringVar(value="0%")
+        tk.Label(
+            self._loading_label,
+            textvariable=self._load_pct_var,
+            fg=W95_TEXT, bg=W95_BG,
+            font=W95_FONT,
+        ).pack()
+
+        # Progress tracking: 3 init steps + N GIFs (populated later)
+        self._load_total   = 3   # will be increased when gif list is known
+        self._load_done    = 0
+
+        def _draw_progress():
+            """Redraw the Win95-style filled progress bar on the canvas."""
+            try:
+                self._pb_canvas.update_idletasks()
+                w = self._pb_canvas.winfo_width()
+                h = self._pb_canvas.winfo_height()
+                if w < 2 or h < 2:
+                    return
+                pct = min(self._load_done / max(self._load_total, 1), 1.0)
+                fill_w = max(0, int(w * pct))
+                self._pb_canvas.delete("all")
+                # Blue filled blocks (Win95 uses chunky segmented blocks)
+                block = 16
+                gap   = 2
+                x = 0
+                while x + block <= fill_w:
+                    self._pb_canvas.create_rectangle(
+                        x, 1, x + block - gap, h - 1,
+                        fill=W95_TITLE_BG, outline="",
+                    )
+                    x += block
+                pct_int = int(pct * 100)
+                self._load_pct_var.set(f"{pct_int}%")
+            except Exception:
+                pass
+
+        self._draw_progress = _draw_progress
+
+        def _advance_progress(status: str, steps: int = 1):
+            """Thread-safe progress advance — call from any thread."""
+            def _on_main():
+                self._load_done += steps
+                self._load_status_var.set(status)
+                self._draw_progress()
+            try:
+                self.root.after(0, _on_main)
+            except Exception:
+                pass
+
+        self._advance_progress = _advance_progress
+
+        # Draw the initial (empty) bar once the canvas is mapped
+        self._loading_label.after(50, _draw_progress)
+
+        # Force update so the window and loading label become visible immediately.
+        # On Windows 11, overrideredirect windows can render as a black rectangle
+        # until the compositor receives a proper redraw signal. Calling both
+        # update_idletasks() and update() — plus a deiconify/lift pair — flushes
+        # the DWM pipeline and makes the loading label appear on the first frame.
         try:
+            self.root.update_idletasks()
+            self.root.update()
+            # deiconify + lift forces the compositor to composite the window immediately
+            self.root.deiconify()
+            self.root.lift()
             self.root.update()
         except Exception:
             pass
@@ -682,6 +874,11 @@ class CompanionApp:
         self._is_minimized = False
 
     def _build_ui(self):
+        # Patch font constants now that Tk is alive and tkfont.families() is valid
+        global W95_FONT, W95_FONT_BOLD
+        W95_FONT      = _safe_win_font(8, bold=False)
+        W95_FONT_BOLD = _safe_win_font(8, bold=True)
+
         # ── Outer raised bevel (whole window border) ──────────────────────────
         self._outer = tk.Frame(self.root, bg=W95_BG, relief="raised", bd=2)
         self._outer.pack(fill="both", expand=True)
@@ -693,7 +890,7 @@ class CompanionApp:
 
         # App icon + title
         title_lbl = tk.Label(
-            title_bar, text="🖥  Agetha.exe",
+            title_bar, text="⚠  Agetha.exe",
             bg=W95_TITLE_BG, fg=W95_TITLE_FG,
             font=W95_FONT_BOLD, anchor="w", padx=4,
         )
@@ -743,8 +940,9 @@ class CompanionApp:
         gif_border.pack(fill="x", padx=4, pady=(4, 0))
 
         self._gif_label = tk.Label(gif_border, bg="#000000", bd=0,
-                                   width=GIF_W, height=GIF_H)
-        self._gif_label.pack()
+                                   width=GIF_W, height=GIF_H,
+                                   anchor="center")
+        self._gif_label.pack(fill="both", expand=True)
 
         # ── Status bar ────────────────────────────────────────────────────────
         status_frame = tk.Frame(self._outer, bg=W95_BG, bd=1, relief="sunken")
@@ -803,17 +1001,27 @@ class CompanionApp:
         self._drag_x, self._drag_y = e.x_root, e.y_root
 
     def _minimize(self):
-        """Minimize the overrideredirect window via the iconify trick."""
-        self.root.overrideredirect(False)
-        self.root.iconify()
+        """Minimize the overrideredirect window.
+        On Windows, overrideredirect windows can't be iconified directly — we
+        temporarily restore normal chrome, iconify, then re-apply our settings
+        once the window is mapped again. A short delay avoids a race with DWM."""
+        try:
+            self.root.overrideredirect(False)
+            self.root.iconify()
+        except Exception:
+            return
         def _bind_restore():
             def _on_map(event):
-                if self.root.state() != "iconic":
-                    self.root.overrideredirect(True)
-                    self.root.attributes("-topmost", True)
-                    self.root.unbind("<Map>")
+                try:
+                    if self.root.state() != "iconic":
+                        self.root.overrideredirect(True)
+                        self.root.attributes("-topmost", True)
+                        self.root.lift()
+                        self.root.unbind("<Map>")
+                except Exception:
+                    pass
             self.root.bind("<Map>", _on_map)
-        self.root.after(200, _bind_restore)
+        self.root.after(250, _bind_restore)
 
     def _on_user_input(self, event=None):
         text = self._input_var.get().strip()
@@ -832,14 +1040,70 @@ class CompanionApp:
         self._input_box.focus_set()
 
     def _preload_gifs(self):
-        # preload both animated emotion gifs and their static counterparts (if present)
+        """Load all GIFs without blocking the main thread.
+
+        Phase 1 (background thread): PIL open/convert/resize/composite for every GIF.
+        Phase 2 (main thread, via after()):  ImageTk.PhotoImage creation + GifPlayer init.
+        The loading label stays visible throughout Phase 1 so users never see a black screen.
+        """
         static_vals = list(self.EXTRA_STATIC_GIFS.values()) if getattr(self, 'EXTRA_STATIC_GIFS', None) else []
-        for name in self.IDLE_GIFS + self.TALKING_GIFS + list(self.EXTRA_GIFS.values()) + static_vals:
-            path = ASSETS / name
-            if path.exists():
-                self._gif_cache[name] = GifPlayer(self._gif_label, str(path), self.root.after)
-            else:
-                print(f"[WARN] Missing asset: {path}")
+        all_names = self.IDLE_GIFS + self.TALKING_GIFS + list(self.EXTRA_GIFS.values()) + static_vals
+
+        def _phase1():
+            """Run entirely in a background thread — no Tk calls allowed here."""
+            results: dict[str, tuple[list, list]] = {}  # name → (pil_frames, delays)
+            missing: list[str] = []
+            # Tell the progress bar how many total steps to expect (3 init + N gifs)
+            try:
+                self.root.after(0, lambda: setattr(self, '_load_total', 3 + len(all_names)))
+            except Exception:
+                pass
+            for name in all_names:
+                path = ASSETS / name
+                if path.exists():
+                    pil_frames, delays = _load_gif_frames_offthread(str(path))
+                    results[name] = (pil_frames, delays)
+                else:
+                    print(f"[WARN] Missing asset: {path}")
+                    missing.append(name)
+                try:
+                    self._advance_progress(f"Loading {name}…")
+                except Exception:
+                    pass
+            # Hand off to main thread for Phase 2
+            self.root.after(0, lambda: _phase2(results, missing))
+
+        def _phase2(results: dict, missing: list):
+            """Run on the main thread — creates ImageTk objects and GifPlayer instances."""
+            for name, (pil_frames, delays) in results.items():
+                try:
+                    self._gif_cache[name] = GifPlayer(
+                        self._gif_label, name, self.root.after,
+                        pil_frames=pil_frames, delays=delays,
+                    )
+                except Exception as e:
+                    print(f"[GifPlayer] Failed to create player for {name}: {e}")
+
+            if missing:
+                msg = "Missing asset files in the assets/ folder:\n" + "\n".join(missing[:8])
+                if len(missing) > 8:
+                    msg += f"\n...and {len(missing) - 8} more."
+                native_error_popup("Agetha — Missing Assets", msg)
+
+            # Phase 2 complete — now safe to remove loading label and start wake sequence
+            try:
+                if hasattr(self, "_loading_label") and self._loading_label:
+                    self._loading_label.destroy()
+                    self._loading_label = None
+            except Exception:
+                pass
+            try:
+                self._start_wake_sequence()
+            except Exception as e:
+                print(f"[BackgroundInit] start_wake_sequence failed: {e}")
+                native_error_popup("Agetha — Startup Error", f"Startup sequence failed:\n{e}")
+
+        threading.Thread(target=_phase1, daemon=True).start()
 
     def _init_background(self):
         """Run heavy initialization off the main thread."""
@@ -847,18 +1111,38 @@ class CompanionApp:
             bleep = None
             screen = None
             ai = None
+
+            def _show_error_popup(lines: list):
+                """Thread-safe error reporter — native OS dialog only, no custom UI."""
+                native_error_popup("Agetha — Error", "\n".join(lines))
+
             try:
                 bleep = BleepPlayer()
             except Exception as e:
                 print(f"[BackgroundInit] Bleep init failed: {e}")
+                native_error_popup("Agetha — Audio Error", f"Audio init failed:\n{e}\n\nSound will be disabled.")
+            try:
+                self._advance_progress("Audio engine ready…")
+            except Exception:
+                pass
             try:
                 screen = ScreenReader()
             except Exception as e:
                 print(f"[BackgroundInit] ScreenReader init failed: {e}")
+                native_error_popup("Agetha — Screen Reader Error", f"Screen reader failed to start:\n{e}\n\nScreen reading will be disabled.")
             try:
-                ai = AIEngine()
+                self._advance_progress("Screen reader ready…")
+            except Exception:
+                pass
+            try:
+                ai = AIEngine(on_error=_show_error_popup)
             except Exception as e:
                 print(f"[BackgroundInit] AIEngine init failed: {e}")
+                native_error_popup("Agetha — AI Engine Error", f"AI engine failed to start:\n{e}")
+            try:
+                self._advance_progress("AI engine ready…")
+            except Exception:
+                pass
 
             # Apply the results on the main thread (UI-safe operations there)
             def _finish():
@@ -872,23 +1156,13 @@ class CompanionApp:
                             self._subtitle._bleep = self._bleep
                     except Exception:
                         pass
-                    # Remove the loading label now that assets are about to appear
-                    try:
-                        if hasattr(self, "_loading_label") and self._loading_label:
-                            self._loading_label.destroy()
-                            self._loading_label = None
-                    except Exception:
-                        pass
-                    # Preload gifs (must run on main thread because ImageTk uses Tk)
+                    # Kick off GIF preloading — it handles the loading label and
+                    # wake sequence itself once PIL work is done off the main thread.
                     try:
                         self._preload_gifs()
                     except Exception as e:
                         print(f"[BackgroundInit] preload_gifs failed: {e}")
-                    # Start wake sequence once resources are ready
-                    try:
-                        self._start_wake_sequence()
-                    except Exception as e:
-                        print(f"[BackgroundInit] start_wake_sequence failed: {e}")
+                        native_error_popup("Agetha — Asset Error", f"Failed to load GIF assets:\n{e}")
                 except Exception:
                     pass
 
@@ -898,6 +1172,7 @@ class CompanionApp:
                 _finish()
         except Exception as e:
             print(f"[BackgroundInit] Unexpected error: {e}")
+            native_error_popup("Agetha — Unexpected Error", f"Unexpected startup error:\n{e}")
 
     def _play_gif(self, name: str):
         if self._current_gif_player:
@@ -1090,11 +1365,25 @@ class CompanionApp:
         def _on_token(raw_so_far: str):
             self._subtitle.show_thinking(raw_so_far)
 
-        response = self._ai.query_streaming(
-            screen_context=screen_text if not is_user else self._last_screen_text,
-            user_message=user_message or "",
-            on_token=_on_token,
-        )
+        try:
+            response = self._ai.query_streaming(
+                screen_context=screen_text if not is_user else self._last_screen_text,
+                user_message=user_message or "",
+                on_token=_on_token,
+            )
+        except Exception as exc:
+            err_str = str(exc)
+            print(f"[AI_TICK] Unhandled exception: {err_str}")
+            # Only show for non-groq-limit errors
+            _groq_limit_keywords = ("rate_limit", "rate limit", "429", "quota", "groq_exhausted")
+            is_groq_limit = any(kw in err_str.lower() for kw in _groq_limit_keywords)
+            if not is_groq_limit:
+                _short = err_str[:200] if len(err_str) > 200 else err_str
+                native_error_popup("Agetha — Error", f"An error occurred:\n{_short}")
+            self.root.after(0, self._re_enable_input)
+            self.root.after(0, lambda: self._set_state(self.STATE_IDLE))
+            self._reschedule_screen_poll()
+            return
 
         print("\n" + "─" * 52)
         if user_message:
@@ -1597,7 +1886,7 @@ def _early_config_check():
     if config_path.exists():
         return  # Nothing to do
 
-    default_config = """# Agetha version 4.0 config file, @tomiszivacs on TikTok
+    default_config = """# Agetha version 4.0.1 config file, @tomiszivacs on TikTok
     
     # Set to "yes" to use a local AI model via Ollama instead of Groq. Make sure to set LOCAL_AI_MODEL if enabling.
     USE_LOCAL_AI = no
@@ -1633,6 +1922,8 @@ def _early_config_check():
     HISTORY_LIMIT = 6
     # How many characters Agetha can read from a file? (The higher, the more Agetha can understand documents but also the more expensive the prompts)
     FILE_READ_CHARS = 200
+    # Animation speed multiplier for GIFs (lower = faster, higher = slower). Default: 0.6
+    ANIMATION_SPEED = 0.6
 """
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(default_config, encoding="utf-8")
