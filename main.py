@@ -3,7 +3,8 @@ Desktop AI Companion - Main Application
 Requires: pip install pillow pyautogui pytesseract numpy pygame requests
 Assets folder must contain: idle-1.gif, idle-2.gif, idle-3.gif,
   talking-1.gif, talking-2.gif, talking-3.gif,
-  thinking.gif, sleeping.gif, happy.gif, surprised.gif, sad.gif, excited.gif, angry.gif
+  thinking.gif, sleeping.gif, happy.gif, surprised.gif, sad.gif, angry.gif
+  (excited mood reuses happy.gif — no separate excited.gif needed)
 Font: barrio.ttf must be in assets/ folder
 """
 
@@ -694,7 +695,7 @@ class CompanionApp:
         "happy":     "happy.gif",
         "surprised": "surprised.gif",
         "sad":       "sad.gif",
-        "excited":   "excited.gif",
+        "excited":   "happy.gif",   # excited shares happy.gif — same animation, distinct mood
         "angry":     "angry.gif",
         "thinking":  "thinking.gif",
         "sleeping":  "sleeping.gif",
@@ -754,6 +755,7 @@ class CompanionApp:
         self._loaf_job = None
         self._is_loafing = False
         self._pending_shutdown = False
+        self._last_touch_time: float = 0.0   # epoch time of last gif-click touch event
 
         self._build_ui()
 
@@ -943,6 +945,8 @@ class CompanionApp:
                                    width=GIF_W, height=GIF_H,
                                    anchor="center")
         self._gif_label.pack(fill="both", expand=True)
+        # Clicking on Agetha sends a touch event to the AI (10 s cooldown)
+        self._gif_label.bind("<Button-1>", self._on_gif_click)
 
         # ── Status bar ────────────────────────────────────────────────────────
         status_frame = tk.Frame(self._outer, bg=W95_BG, bd=1, relief="sunken")
@@ -1023,6 +1027,23 @@ class CompanionApp:
             self.root.bind("<Map>", _on_map)
         self.root.after(250, _bind_restore)
 
+    def _on_gif_click(self, event=None):
+        """Handle a click on the Agetha gif — sends a hidden touch message to the AI.
+        A 10-second cooldown prevents spamming."""
+        now = time.time()
+        if now - self._last_touch_time < 10.0:
+            return   # still in cooldown, silently ignore
+        self._last_touch_time = now
+        # Don't interrupt an ongoing AI response or block the input box permanently
+        if self._input_box["state"] == "disabled":
+            return
+        self._persistent_mood = None
+        threading.Thread(
+            target=self._ai_tick,
+            kwargs={"user_message": "__touch__"},
+            daemon=True,
+        ).start()
+
     def _on_user_input(self, event=None):
         text = self._input_var.get().strip()
         if not text:
@@ -1047,29 +1068,63 @@ class CompanionApp:
         The loading label stays visible throughout Phase 1 so users never see a black screen.
         """
         static_vals = list(self.EXTRA_STATIC_GIFS.values()) if getattr(self, 'EXTRA_STATIC_GIFS', None) else []
-        all_names = self.IDLE_GIFS + self.TALKING_GIFS + list(self.EXTRA_GIFS.values()) + static_vals
+        # Use dict.fromkeys to preserve order while deduplicating (excited shares happy.gif)
+        all_names = list(dict.fromkeys(
+            self.IDLE_GIFS + self.TALKING_GIFS + list(self.EXTRA_GIFS.values()) + static_vals
+        ))
 
         def _phase1():
-            """Run entirely in a background thread — no Tk calls allowed here."""
+            """Run entirely in a background thread — no Tk calls allowed here.
+            Each GIF is decoded in parallel via a ThreadPoolExecutor so PIL
+            open/convert/resize/composite work for all assets happens at the same time.
+            """
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
             results: dict[str, tuple[list, list]] = {}  # name → (pil_frames, delays)
             missing: list[str] = []
+
             # Tell the progress bar how many total steps to expect (3 init + N gifs)
             try:
                 self.root.after(0, lambda: setattr(self, '_load_total', 3 + len(all_names)))
             except Exception:
                 pass
+
+            # Separate existing from missing up front so we only submit real files
+            to_load = []
             for name in all_names:
-                path = ASSETS / name
-                if path.exists():
-                    pil_frames, delays = _load_gif_frames_offthread(str(path))
-                    results[name] = (pil_frames, delays)
+                asset_path = ASSETS / name
+                if asset_path.exists():
+                    to_load.append((name, str(asset_path)))
                 else:
-                    print(f"[WARN] Missing asset: {path}")
+                    print(f"[WARN] Missing asset: {asset_path}")
                     missing.append(name)
+                    try:
+                        self._advance_progress(f"Missing {name}…")
+                    except Exception:
+                        pass
+
+            # Use as many workers as there are GIFs (capped at 8 to avoid over-subscription)
+            n_workers = min(len(to_load), 8) if to_load else 1
+
+            def _load_one(name_and_path):
+                n, p = name_and_path
+                frames, delays = _load_gif_frames_offthread(p)
                 try:
-                    self._advance_progress(f"Loading {name}…")
+                    self._advance_progress(f"Loading {n}…")
                 except Exception:
                     pass
+                return n, frames, delays
+
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                futures = {pool.submit(_load_one, item): item[0] for item in to_load}
+                for fut in as_completed(futures):
+                    try:
+                        n, frames, delays = fut.result()
+                        results[n] = (frames, delays)
+                    except Exception as e:
+                        n = futures[fut]
+                        print(f"[GifPlayer] Failed to load {n}: {e}")
+
             # Hand off to main thread for Phase 2
             self.root.after(0, lambda: _phase2(results, missing))
 
@@ -1386,7 +1441,7 @@ class CompanionApp:
             return
 
         print("\n" + "─" * 52)
-        if user_message:
+        if user_message and user_message != "__touch__":
             print(f"[USER]  {user_message}")
         print(f"[AI]    {json.dumps(response, ensure_ascii=False)}")
         print("─" * 52)
@@ -1886,7 +1941,7 @@ def _early_config_check():
     if config_path.exists():
         return  # Nothing to do
 
-    default_config = """# Agetha version 4.0.1 config file, @tomiszivacs on TikTok
+    default_config = """# Agetha version 4.0.2 config file, @tomiszivacs on TikTok
     
     # Set to "yes" to use a local AI model via Ollama instead of Groq. Make sure to set LOCAL_AI_MODEL if enabling.
     USE_LOCAL_AI = no
