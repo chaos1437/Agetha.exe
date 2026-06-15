@@ -217,14 +217,163 @@ class BleepPlayer:
 
 # ── Voice input (microphone) ───────────────────────────────────────────────────
 
+def _settings_path() -> Path:
+    """Return path to memory/settings.json next to main.py / the executable."""
+    base = Path(sys.argv[0]).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).parent
+    return base / "memory" / "settings.json"
+
+
+def _load_settings() -> dict:
+    p = _settings_path()
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_settings(data: dict) -> None:
+    p = _settings_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"[Settings] Saved to {p}")
+    except Exception as e:
+        print(f"[Settings] Could not save: {e}")
+
+
+def _list_microphones() -> list[tuple[int, str]]:
+    """Return [(index, name), ...] for every available input device."""
+    try:
+        import speech_recognition as sr
+        mics = []
+        for i, name in enumerate(sr.Microphone.list_microphone_names()):
+            mics.append((i, name))
+        return mics
+    except Exception as e:
+        print(f"[Voice] Could not list microphones: {e}")
+        return []
+
+
+class MicPickerDialog:
+    """Win95-style dialog that lets the user choose a microphone device."""
+
+    def __init__(self, parent: tk.Tk, mics: list[tuple[int, str]]):
+        self.result: int | None = None   # chosen device index, or None = cancelled
+
+        self._win = tk.Toplevel(parent)
+        self._win.overrideredirect(True)
+        self._win.attributes("-topmost", True)
+        self._win.configure(bg=W95_BG)
+        self._win.resizable(False, False)
+        self._drag_x = self._drag_y = 0
+
+        outer = tk.Frame(self._win, bg=W95_BG, relief="raised", bd=2)
+        outer.pack(fill="both", expand=True)
+
+        # Title bar
+        title_bar = tk.Frame(outer, bg=W95_TITLE_BG, height=18)
+        title_bar.pack(fill="x", padx=2, pady=(2, 0))
+        title_bar.pack_propagate(False)
+        tk.Label(title_bar, text="🎤  Select Microphone",
+                 bg=W95_TITLE_BG, fg=W95_TITLE_FG,
+                 font=W95_FONT_BOLD, anchor="w", padx=4).pack(side="left", fill="y")
+        for w in title_bar.winfo_children():
+            w.bind("<ButtonPress-1>", self._drag_start)
+            w.bind("<B1-Motion>",     self._drag_motion)
+        title_bar.bind("<ButtonPress-1>", self._drag_start)
+        title_bar.bind("<B1-Motion>",     self._drag_motion)
+
+        body = tk.Frame(outer, bg=W95_BG, padx=12, pady=10)
+        body.pack(fill="both", expand=True)
+
+        tk.Label(body, text="Choose which microphone Agetha should use:",
+                 fg=W95_TEXT, bg=W95_BG, font=W95_FONT,
+                 wraplength=260, justify="left").pack(anchor="w", pady=(0, 6))
+
+        list_frame = tk.Frame(body, bg=W95_BG, relief="sunken", bd=2)
+        list_frame.pack(fill="both", expand=True)
+
+        scrollbar = tk.Scrollbar(list_frame, orient="vertical")
+        self._listbox = tk.Listbox(list_frame, font=W95_FONT,
+                                    bg=W95_INPUT_BG, fg=W95_TEXT,
+                                    selectbackground=W95_TITLE_BG,
+                                    selectforeground=W95_TITLE_FG,
+                                    relief="flat", bd=0, height=min(len(mics), 8),
+                                    yscrollcommand=scrollbar.set)
+        scrollbar.config(command=self._listbox.yview)
+        scrollbar.pack(side="right", fill="y")
+        self._listbox.pack(side="left", fill="both", expand=True)
+
+        for idx, name in mics:
+            self._listbox.insert("end", f"[{idx}]  {name}")
+
+        if mics:
+            self._listbox.selection_set(0)
+
+        self._mics = mics
+
+        tk.Frame(outer, bg=W95_SHADOW, height=1).pack(fill="x", padx=2, pady=(6, 0))
+        tk.Frame(outer, bg="#ffffff",  height=1).pack(fill="x", padx=2)
+
+        btn_row = tk.Frame(outer, bg=W95_BG, pady=6)
+        btn_row.pack(fill="x")
+
+        tk.Button(btn_row, text="OK", font=W95_FONT_BOLD,
+                  bg=W95_BTN_BG, fg=W95_TEXT,
+                  activebackground=W95_BTN_ACT, activeforeground=W95_BTN_AFG,
+                  relief="raised", bd=2, width=8, pady=2,
+                  command=self._ok).pack(side="left", padx=(16, 4))
+        tk.Button(btn_row, text="Cancel", font=W95_FONT_BOLD,
+                  bg=W95_BTN_BG, fg=W95_TEXT,
+                  activebackground=W95_BTN_ACT, activeforeground=W95_BTN_AFG,
+                  relief="raised", bd=2, width=8, pady=2,
+                  command=self._cancel).pack(side="left", padx=4)
+
+        self._win.update_idletasks()
+        px = parent.winfo_x(); py = parent.winfo_y()
+        pw = parent.winfo_width(); ph = parent.winfo_height()
+        ww = self._win.winfo_width(); wh = self._win.winfo_height()
+        x = px + (pw - ww) // 2; y = py + (ph - wh) // 2
+        self._win.geometry(f"+{max(0,x)}+{max(0,y)}")
+        self._win.bind("<Return>", lambda _: self._ok())
+        self._win.bind("<Escape>", lambda _: self._cancel())
+        try: self._win.focus_force(); self._listbox.focus_set()
+        except Exception: pass
+
+    def _ok(self):
+        sel = self._listbox.curselection()
+        if sel:
+            self.result = self._mics[sel[0]][0]
+        self._win.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self._win.destroy()
+
+    def _drag_start(self, e):
+        self._drag_x, self._drag_y = e.x_root, e.y_root
+
+    def _drag_motion(self, e):
+        dx = e.x_root - self._drag_x; dy = e.y_root - self._drag_y
+        self._win.geometry(f"+{self._win.winfo_x()+dx}+{self._win.winfo_y()+dy}")
+        self._drag_x, self._drag_y = e.x_root, e.y_root
+
+    def wait(self):
+        self._win.wait_window()
+        return self.result
+
+
 class VoiceInput:
     """Continuous microphone listener. Sends transcribed text via callback when
     the user pauses for SILENCE_SECONDS (default 3 s) after speaking."""
 
-    SILENCE_SECONDS = 3.0
+    SILENCE_SECONDS = 1.2
 
-    def __init__(self, on_text_callback):
-        self._cb     = on_text_callback
+    def __init__(self, on_text_callback, device_index: int | None = None):
+        self._cb           = on_text_callback
+        self._device_index = device_index
         self._active = False
         self._thread: threading.Thread | None = None
         self._stop   = threading.Event()
@@ -264,7 +413,11 @@ class VoiceInput:
         recognizer.energy_threshold = 300
         recognizer.dynamic_energy_threshold = True
 
-        with sr.Microphone() as source:
+        mic_kwargs = {}
+        if self._device_index is not None:
+            mic_kwargs["device_index"] = self._device_index
+
+        with sr.Microphone(**mic_kwargs) as source:
             recognizer.adjust_for_ambient_noise(source, duration=0.5)
             while not self._stop.is_set():
                 try:
@@ -280,11 +433,22 @@ class VoiceInput:
 
     def _recognise(self, recognizer, audio):
         try:
-            import speech_recognition as sr
-            text = recognizer.recognize_google(audio)
-            if text and text.strip():
+            if _USE_LOCAL_STT:
+                model = _get_whisper_model()
+                if model is None:
+                    return
+                import io, wave, numpy as np
+                raw = audio.get_raw_data(convert_rate=16000, convert_width=2)
+                arr = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+                segments, _ = model.transcribe(arr, language="en", beam_size=1,
+                                               vad_filter=True, vad_parameters={"min_silence_duration_ms": 300})
+                text = " ".join(s.text for s in segments).strip()
+            else:
+                import speech_recognition as sr
+                text = recognizer.recognize_google(audio)
+            if text:
                 print(f"[Voice] Recognised: {text}")
-                self._cb(text.strip())
+                self._cb(text)
         except Exception:
             pass  # silence / unrecognised audio — ignore
 
@@ -325,6 +489,44 @@ def _read_faster_mode() -> bool:
     return False
 
 _FASTER_MODE = _read_faster_mode()
+
+
+def _read_local_stt() -> bool:
+    try:
+        _base = Path(sys.argv[0]).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).parent
+        _cfg = _base / "config.txt"
+        if _cfg.exists():
+            for ln in _cfg.read_text(encoding="utf-8", errors="replace").splitlines():
+                s = ln.strip()
+                if s.startswith("#") or "=" not in s: continue
+                k, v = s.split("=", 1)
+                if k.strip().upper() == "USE_LOCAL_STT":
+                    return v.strip().lower() in ("yes", "true", "1", "on")
+    except Exception:
+        pass
+    return False
+
+_USE_LOCAL_STT = _read_local_stt()
+
+# Lazy-load faster-whisper model once
+_whisper_model = None
+_whisper_lock  = threading.Lock()
+
+def _get_whisper_model():
+    global _whisper_model
+    if _whisper_model is not None:
+        return _whisper_model
+    with _whisper_lock:
+        if _whisper_model is None:
+            try:
+                from faster_whisper import WhisperModel
+                print("[STT] Loading faster-whisper model (tiny.en) — first run only...")
+                _whisper_model = WhisperModel("tiny.en", device="cpu", compute_type="int8")
+                print("[STT] faster-whisper ready.")
+            except Exception as e:
+                print(f"[STT] faster-whisper load failed: {e}")
+                _whisper_model = None
+    return _whisper_model
 
 
 def _load_gif_frames_offthread(path: str) -> tuple[list[Image.Image], list[int]]:
@@ -990,8 +1192,33 @@ class CompanionApp:
 
     def _toggle_mic(self):
         if self._voice is None:
-            # Not yet initialised
-            self._voice = VoiceInput(on_text_callback=self._on_voice_text)
+            # Check for saved microphone preference
+            settings = _load_settings()
+            device_index = settings.get("mic_device_index", None)
+
+            if device_index is None:
+                # No saved preference — ask the user to pick one
+                mics = _list_microphones()
+                if not mics:
+                    native_error_popup(
+                        "Agetha — Microphone",
+                        "No microphone devices found.\n"
+                        "Make sure a microphone is connected and pyaudio is installed."
+                    )
+                    return
+                picker = MicPickerDialog(self.root, mics)
+                chosen = picker.wait()
+                if chosen is None:
+                    return   # user cancelled
+                device_index = chosen
+                mic_name = next((n for i, n in mics if i == chosen), str(chosen))
+                settings["mic_device_index"] = device_index
+                settings["mic_device_name"]  = mic_name
+                _save_settings(settings)
+                print(f"[Voice] Microphone saved: [{device_index}] {mic_name}")
+
+            self._voice = VoiceInput(on_text_callback=self._on_voice_text,
+                                     device_index=device_index)
             if not self._voice.available:
                 native_error_popup("Agetha — Microphone", self._voice.error or "SpeechRecognition unavailable.")
                 self._voice = None
@@ -1001,7 +1228,7 @@ class CompanionApp:
             self._mic_active = False
             if self._voice: self._voice.stop()
             self._mic_btn_var.set("🎤")
-            self._mic_btn.config(bg=W95_BTN_BG)
+            self._mic_btn.config(bg=W95_BTN_BG, fg=W95_TEXT, activebackground=W95_BTN_BG)
             print("[Voice] Microphone off")
         else:
             self._mic_active = True
@@ -1362,6 +1589,8 @@ class CompanionApp:
         if self._input_box["state"] == "disabled": return
         self._input_var.set("")
         self._input_box.config(state="disabled")
+        self._placeholder_lbl.config(text="Processing...")
+        self._placeholder_lbl.place(relx=0, rely=0, relwidth=1, relheight=1)
         self._persistent_mood = None
         threading.Thread(target=self._ai_tick, kwargs={"user_message": text}, daemon=True).start()
 
@@ -2270,10 +2499,15 @@ def _early_config_check():
     if config_path.exists():
         return
 
-    default_config = """# Agetha v5 config — @tomiszivacs on TikTok
+    default_config = """# Agetha v5.0.1 config — @tomiszivacs on TikTok
 
 # Set to "yes" to use Ollama instead of Groq.
 USE_LOCAL_AI = no
+
+# Set to "yes" to use local Whisper (faster-whisper) for voice input instead of Google STT.
+# Much faster — no internet needed. Requires: pip install faster-whisper numpy
+# Downloads a small ~75 MB model (tiny.en) on first run.
+USE_LOCAL_STT = yes
 
 # Groq API keys (use separate accounts to avoid rate limits)
 GROQ_API_KEY = 
