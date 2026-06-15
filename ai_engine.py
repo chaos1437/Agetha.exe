@@ -548,7 +548,7 @@ class AIEngine:
 
     def _create_default_config(self) -> None:
         default = """\
-# Agetha v5 config
+# Agetha v5.0.1 config
 USE_LOCAL_AI = no
 GROQ_API_KEY =
 GROQ_API_KEY_2 =
