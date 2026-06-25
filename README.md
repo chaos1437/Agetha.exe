@@ -1,4 +1,5 @@
 Source code for Agetha.
-To download assets, go to https://chocolatebread.ddns.net/agetha.html
+
+pip install pillow pyautogui pytesseract numpy pygame-ce requests pywin32 SpeechRecognition pyaudio
 
 Have fun!

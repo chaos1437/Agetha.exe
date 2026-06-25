@@ -1,5 +1,5 @@
 """
-ai_engine.py v5 — Groq / Ollama integration for Agetha
+ai_engine.py v6 — OpenAI-compatible LLM integration for Agetha
 """
 
 import json
@@ -11,13 +11,7 @@ import threading
 import platform
 from pathlib import Path
 from datetime import datetime
-from types import SimpleNamespace
-
-try:
-    from groq import Groq
-    GROQ_OK = True
-except ImportError:
-    GROQ_OK = False
+from llm_client import LLMClient
 
 
 def native_error_popup(title: str, message: str) -> None:
@@ -37,123 +31,8 @@ def native_error_popup(title: str, message: str) -> None:
         pass
 
 
-class _LocalOllamaClient:
-    OLLAMA_URL = "http://localhost:11434/api/chat"
-
-    def __init__(self, model: str, timeout: int = 30):
-        self.model = model
-        self.timeout = timeout
-
-    def _generate(self, messages: list) -> str:
-        import urllib.request, json as _j
-        payload = _j.dumps({"model": self.model, "messages": messages, "stream": False}).encode()
-        req = urllib.request.Request(self.OLLAMA_URL, data=payload,
-                                     headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-            raw_bytes = resp.read()
-        text = raw_bytes.decode("utf-8", errors="replace").strip()
-        for line in text.splitlines():
-            line = line.strip()
-            if not line: continue
-            try:
-                j = _j.loads(line)
-                content = (j.get("message", {}).get("content") or j.get("response") or "").strip()
-                if content: return content
-            except Exception: continue
-        return text
-
-    def chat_completions_create(self, model=None, messages=None, temperature=0.7,
-                                max_tokens=400, top_p=0.95, timeout=None, stream=False):
-        msgs = [{"role": (m.get("role") if isinstance(m, dict) else getattr(m, "role", "user")),
-                 "content": (m.get("content") if isinstance(m, dict) else getattr(m, "content", ""))}
-                for m in (messages or [])]
-        raw = self._generate(msgs) or ""
-        if stream:
-            for ch in ([raw[i:i+120] for i in range(0, len(raw), 120)] or [raw]):
-                yield SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=ch))])
-            return
-        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=raw))])
-
-
-class _OpenRouterClient:
-    """Minimal OpenRouter (https://openrouter.ai) chat-completions client.
-
-    EXPERIMENTAL: supports a single API key. Mimics the small subset of the
-    OpenAI-style client interface used elsewhere in this file
-    (chat.completions.create), including streaming.
-    """
-
-    def __init__(self, api_key: str, model: str, timeout: int = 30):
-        self.api_key = api_key
-        self.model = model
-        self.timeout = timeout
-
-    def chat_completions_create(self, model=None, messages=None, temperature=0.7,
-                                max_tokens=400, top_p=0.95, timeout=None, stream=False):
-        import urllib.request, json as _j
-
-        msgs = [{"role": (m.get("role") if isinstance(m, dict) else getattr(m, "role", "user")),
-                 "content": (m.get("content") if isinstance(m, dict) else getattr(m, "content", ""))}
-                for m in (messages or [])]
-
-        payload = {
-            "model": model or self.model,
-            "messages": msgs,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "top_p": top_p,
-            "stream": stream,
-        }
-        req = urllib.request.Request(
-            OPENROUTER_API_URL,
-            data=_j.dumps(payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-            },
-            method="POST",
-        )
-        to = timeout or self.timeout
-
-        if stream:
-            def _gen():
-                with urllib.request.urlopen(req, timeout=to) as resp:
-                    for line_bytes in resp:
-                        line = line_bytes.decode("utf-8", errors="replace").strip()
-                        if not line or not line.startswith("data:"):
-                            continue
-                        data_str = line[len("data:"):].strip()
-                        if data_str == "[DONE]":
-                            break
-                        try:
-                            chunk = _j.loads(data_str)
-                        except Exception:
-                            continue
-                        choices = chunk.get("choices") or [{}]
-                        delta = (choices[0] or {}).get("delta") or {}
-                        content = delta.get("content") or ""
-                        usage_obj = chunk.get("usage")
-                        ns_usage = SimpleNamespace(**usage_obj) if isinstance(usage_obj, dict) else None
-                        yield SimpleNamespace(
-                            choices=[SimpleNamespace(delta=SimpleNamespace(content=content))],
-                            usage=ns_usage,
-                        )
-            return _gen()
-
-        with urllib.request.urlopen(req, timeout=to) as resp:
-            raw_bytes = resp.read()
-        obj = _j.loads(raw_bytes.decode("utf-8", errors="replace"))
-        content = ((obj.get("choices") or [{}])[0].get("message") or {}).get("content", "")
-        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
-
-
 CONFIG_FILE_NAME = "config.txt"
-GROQ_MODELS = ["llama-3.3-70b-versatile"]
 TIMEOUT = 30
-
-# ── OpenRouter (EXPERIMENTAL) ──────────────────────────────────────────────────
-OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_OPENROUTER_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
 
 VALID_MOODS    = {"neutral", "happy", "excited", "sad", "surprised", "thinking", "whisper", "angry"}
 VALID_COMMANDS = {
@@ -392,7 +271,6 @@ class AIEngine:
         except Exception:
             self._compact_chars = ""
 
-        self._fatal_local_ai_error = False
         self._show_error_gif = False
         self._error_gif_path = str(self._config_path.parent / "assets" / "error.gif")
 
@@ -407,137 +285,16 @@ class AIEngine:
 
         self._command_execution_enabled = self._parse_bool(
             self._config.get("ENABLE_COMMAND_EXECUTION", "yes"), default=True)
-        self._use_local_ai = self._parse_bool(self._config.get("USE_LOCAL_AI", "no"), default=False)
-        self._use_openrouter = self._parse_bool(self._config.get("ENABLE_OPENROUTER", "no"), default=False)
-        self._enable_groq  = self._parse_bool(self._config.get("ENABLE_GROQ", "yes"), default=True)
         self._ocr_focused_window = self._parse_bool(
             self._config.get("OCR_FOCUSED_WINDOW", "yes"), default=True)
 
-        # Priority: local AI > OpenRouter (EXPERIMENTAL) > Groq
-        if self._use_local_ai:
-            self._enable_groq = False
-            self._use_openrouter = False
-        elif self._use_openrouter:
-            self._enable_groq = False
-
-        self._openrouter_key = self._config.get("OPENROUTER_API_KEY", "").strip()
-        self._openrouter_model = (self._config.get("OPENROUTER_MODEL", "").strip()
-                                   or DEFAULT_OPENROUTER_MODEL)
-
-        if not GROQ_OK and not self._use_local_ai and not self._use_openrouter:
-            self._emit_error("The 'groq' package is not installed.", "Run:  pip install groq", "Then restart Agetha.")
-            self._client = None
-            return
-
-        self._groq_keys = []
-        if self._enable_groq:
-            for i in range(1, 11):
-                key_name = "GROQ_API_KEY" if i == 1 else f"GROQ_API_KEY_{i}"
-                key = self._config.get(key_name, "").strip()
-                if key: self._groq_keys.append(key)
-
-        if self._use_openrouter and not self._openrouter_key:
-            self._emit_error("ENABLE_OPENROUTER is set to yes but OPENROUTER_API_KEY is empty.",
-                             "Open config.txt and add a single OpenRouter API key.",
-                             "Get a free key at: openrouter.ai/keys")
-            self._client = None
-            return
-
-        if not self._groq_keys and not self._use_local_ai and not self._use_openrouter:
-            self._emit_error("No GROQ_API_KEY found in config.txt",
-                             "Open config.txt and add at least one Groq API key.",
-                             "Get a free key at: console.groq.com")
-            self._client = None
-            return
-
-        self._current_groq_key_index   = 0
-        self._current_groq_model_index = 0
-        configured_model = self._config.get("GROQ_MODEL", GROQ_MODELS[0]).strip()
-        if configured_model in GROQ_MODELS:
-            self._current_groq_model_index = GROQ_MODELS.index(configured_model)
-
-        self._groq_exhausted = False
-        # Token tracking (Groq daily limit: 100,000 TPD)
-        self._groq_token_limits = {i: 100000 for i in range(len(self._groq_keys))}
-        self._groq_tokens_used = {i: 0 for i in range(len(self._groq_keys))}
-        self._consecutive_idle_count = 0  # track how many idle responses in a row
+        self._llm_api_key = self._config.get("LLM_API_KEY", "").strip()
+        self._llm_base_url = self._config.get("LLM_BASE_URL", "https://api.openai.com/v1").strip()
+        self._llm_model = self._config.get("LLM_MODEL", "gpt-4o-mini").strip()
         self._init_client()
 
-    # ── Token tracking ──────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _estimate_tokens(text: str) -> int:
-        """Rough token estimate: ~4 chars per token (Llama tokenizer approx)."""
-        if not text:
-            return 0
-        return max(1, len(text) // 4)
-
-    def _estimate_request_tokens(self) -> int:
-        """Estimate tokens for the next request based on current system prompt + history."""
-        try:
-            memories = self._load_memories()
-            system_len = len(SYSTEM_PROMPT) + len(memories) + len(getattr(self, "_compact_chars", ""))
-            system_tokens = self._estimate_tokens(system_len * "x")
-
-            # Few shots (static cost, estimate once)
-            few_shot_chars = sum(len(m["content"]) for m in FEW_SHOTS)
-            few_shot_tokens = self._estimate_tokens("x" * few_shot_chars)
-
-            # History
-            history_chars = sum(len(e["user"]) + len(e["assistant"]) for e in self._history)
-            history_tokens = self._estimate_tokens("x" * history_chars)
-
-            # Average user turn size
-            avg_turn_tokens = 80
-
-            # Max response
-            max_response_tokens = 380
-
-            return system_tokens + few_shot_tokens + history_tokens + avg_turn_tokens + max_response_tokens
-        except Exception:
-            return 500
-
     def get_token_status(self) -> dict:
-        """Return current key usage: {'key_index': X, 'key_count': Y, 'pct_left': Z, 'using_groq': bool}"""
-        if self._use_local_ai:
-            return {"using_groq": False, "provider": "local"}
-        if self._use_openrouter:
-            return {"using_groq": False, "provider": "openrouter", "model": self._openrouter_model}
-        if not self._groq_keys:
-            return {"using_groq": False, "provider": "local"}
-        idx = self._current_groq_key_index
-        limit = self._groq_token_limits.get(idx, 100000)
-        used = self._groq_tokens_used.get(idx, 0)
-
-        # Add estimated cost of next request to give a more accurate picture
-        next_request_est = self._estimate_request_tokens()
-        effective_used = used + next_request_est
-
-        left = max(0, limit - effective_used)
-        pct_left = max(0, int(100.0 * left / limit)) if limit > 0 else 0
-        return {
-            "using_groq": True,
-            "provider": "groq",
-            "key_index": idx + 1,
-            "key_count": len(self._groq_keys),
-            "tokens_used": used,
-            "tokens_left": left,
-            "next_request_est": next_request_est,
-            "pct_left": pct_left,
-        }
-
-    def _track_tokens(self, usage_obj) -> None:
-        """Extract and track token usage from Groq response."""
-        if not self._enable_groq or not usage_obj:
-            return
-        try:
-            total = int(getattr(usage_obj, "total_tokens", 0))
-            if total > 0 and self._current_groq_key_index < len(self._groq_keys):
-                self._groq_tokens_used[self._current_groq_key_index] += total
-                pct = max(0, int(100.0 * (100000 - self._groq_tokens_used[self._current_groq_key_index]) / 100000))
-                print(f"[AIEngine] Key {self._current_groq_key_index+1}: +{total} tokens ({pct}% left)")
-        except Exception:
-            pass
+        return {"provider": "openai-compatible"}
 
     # ── Config helpers ─────────────────────────────────────────────────────────
 
@@ -549,28 +306,9 @@ class AIEngine:
     def _create_default_config(self) -> None:
         default = """\
 # Agetha v5.0.1 config
-USE_LOCAL_AI = no
-GROQ_API_KEY =
-GROQ_API_KEY_2 =
-GROQ_API_KEY_3 =
-GROQ_API_KEY_4 =
-GROQ_API_KEY_5 =
-GROQ_API_KEY_6 =
-GROQ_API_KEY_7 =
-GROQ_API_KEY_8 =
-GROQ_API_KEY_9 =
-GROQ_API_KEY_10 =
-GROQ_MODEL = llama-3.3-70b-versatile
-
-# EXPERIMENTAL: OpenRouter support.
-# If enabled, OpenRouter is used and Groq is bypassed entirely.
-# (The default model is kind of stupid, so you may want to change it to something else.)
-ENABLE_OPENROUTER = no
-OPENROUTER_API_KEY =
-OPENROUTER_MODEL = nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free
-
-LOCAL_AI_MODEL =
-LOCAL_AI_TIMEOUT = 30
+LLM_API_KEY =
+LLM_BASE_URL = https://api.openai.com/v1
+LLM_MODEL = gpt-4o-mini
 ENABLE_COMMAND_EXECUTION = yes
 MEMORY_CHARS = 600
 HISTORY_LIMIT = 6
@@ -659,56 +397,14 @@ Daniel: male, messy brown hair, ahoge, blue eyes, yellow hoodie, black pants, fl
     # ── Client init / rotation ─────────────────────────────────────────────────
 
     def _init_client(self):
-        if self._use_local_ai:
-            local_model = self._config.get("LOCAL_AI_MODEL", "").strip()
-            if not local_model:
-                self._emit_error("USE_LOCAL_AI is enabled but LOCAL_AI_MODEL is not set.",
-                                 "Open config.txt and set LOCAL_AI_MODEL to your Ollama model name.")
-                self._client = None; return
-            try:
-                client = _LocalOllamaClient(local_model,
-                                            timeout=int(self._config.get("LOCAL_AI_TIMEOUT", TIMEOUT)))
-                try: client._generate([{"role": "user", "content": "Ping"}])
-                except Exception as ping_err:
-                    raise RuntimeError(f"Ollama unreachable: {ping_err}") from ping_err
-                class _Wrap:
-                    def __init__(self, c): self.chat = SimpleNamespace(completions=SimpleNamespace(create=c.chat_completions_create))
-                self._client = _Wrap(client)
-                print(f"[AIEngine] Using local Ollama model: {local_model}")
-            except Exception as e:
-                self._emit_error(f"Failed to connect to Ollama model '{local_model}'.", f"Error: {e}",
-                                 "Make sure Ollama is running and the model is installed.")
-                self._client = None; self._fatal_local_ai_error = True; self._show_error_gif = True
-            return
-        if self._use_openrouter:
-            try:
-                client = _OpenRouterClient(self._openrouter_key, self._openrouter_model, timeout=TIMEOUT)
-                class _Wrap:
-                    def __init__(self, c): self.chat = SimpleNamespace(completions=SimpleNamespace(create=c.chat_completions_create))
-                self._client = _Wrap(client)
-                print(f"[AIEngine] Using OpenRouter (EXPERIMENTAL) model: {self._openrouter_model}")
-            except Exception as e:
-                self._emit_error("Failed to initialize OpenRouter client.", f"Error: {e}")
-                self._client = None
-            return
-        if self._enable_groq and self._groq_keys:
-            self._client = Groq(api_key=self._groq_keys[self._current_groq_key_index])
-            print(f"[AIEngine] Using Groq/{GROQ_MODELS[self._current_groq_model_index]} "
-                  f"(Key {self._current_groq_key_index+1}/{len(self._groq_keys)})")
-        else:
-            self._client = None
+        self._client = LLMClient(
+            base_url=self._llm_base_url,
+            api_key=self._llm_api_key,
+            timeout=TIMEOUT,
+        )
+        print(f"[AIEngine] Using LLMClient with base_url: {self._llm_base_url}")
 
-    def _rotate_key(self) -> bool:
-        nxt_model = self._current_groq_model_index + 1
-        if nxt_model < len(GROQ_MODELS):
-            self._current_groq_model_index = nxt_model
-            self._init_client(); return True
-        nxt_key = self._current_groq_key_index + 1
-        if nxt_key < len(self._groq_keys):
-            self._current_groq_key_index = nxt_key
-            self._current_groq_model_index = 0
-            self._init_client(); return True
-        return False
+
 
     # ── Memory ─────────────────────────────────────────────────────────────────
 
@@ -842,116 +538,36 @@ Daniel: male, messy brown hair, ahoge, blue eyes, yellow hoodie, black pants, fl
 
         _IDLE_FALLBACKS = [[{"text": "Mm.", "pause": 0.0}]]
 
-        while True:
-            try:
-                raw = ""
-                if self._use_local_ai:
-                    current_model = self._config.get("LOCAL_AI_MODEL", "").strip()
-                elif self._use_openrouter:
-                    current_model = self._openrouter_model
-                else:
-                    current_model = GROQ_MODELS[self._current_groq_model_index]
-                stream = self._client.chat.completions.create(
-                    model=current_model,
-                    messages=[{"role": "system", "content": system}] + messages,
-                    temperature=0.85, max_tokens=380, top_p=0.95, timeout=TIMEOUT, stream=True,
-                )
-                
-                # Collect response and track usage if available
-                usage_obj = None
-                for chunk in stream:
-                    delta = chunk.choices[0].delta.content or ""
-                    if delta:
-                        raw += delta
-                        if on_token: on_token(raw)
-                    # Try to extract usage from final chunk
-                    if hasattr(chunk, "usage") and chunk.usage:
-                        usage_obj = chunk.usage
+        try:
+            raw = ""
+            stream = self._client.chat.completions.create(
+                model=self._llm_model,
+                messages=[{"role": "system", "content": system}] + messages,
+                temperature=0.85, max_tokens=380, top_p=0.95, timeout=TIMEOUT, stream=True,
+            )
 
-                # Track tokens if we got usage data
-                self._track_tokens(usage_obj)
+            for chunk in stream:
+                delta = chunk.choices[0].delta.content or ""
+                if delta:
+                    raw += delta
+                    if on_token: on_token(raw)
 
-                result = self._parse(raw)
-                if is_user and result["command"] == "idle":
-                    import random
-                    result.update(command="speak", mood="neutral", segments=random.choice(_IDLE_FALLBACKS))
-                self._record(user_turn, raw)
+            result = self._parse(raw)
+            if is_user and result["command"] == "idle":
+                import random
+                result.update(command="speak", mood="neutral", segments=random.choice(_IDLE_FALLBACKS))
+            self._record(user_turn, raw)
 
-                # Track consecutive idle responses (ambient polls only)
-                if not is_user:
-                    if result["command"] == "idle":
-                        self._consecutive_idle_count += 1
-                    else:
-                        self._consecutive_idle_count = 0
-                else:
-                    # Any real user interaction resets the loaf counter
-                    self._consecutive_idle_count = 0
+            return result
 
-                # Signal to caller when we've been idle long enough to loaf
-                result["_persistent_loaf"] = self._consecutive_idle_count >= 5
-
-                return result
-
-            except Exception as e:
-                if self._use_local_ai:
-                    provider = f"LocalAI/{self._config.get('LOCAL_AI_MODEL','?')}"
-                elif self._use_openrouter:
-                    provider = f"OpenRouter/{self._openrouter_model}"
-                else:
-                    provider = f"Groq/{GROQ_MODELS[self._current_groq_model_index]}"
-                print(f"[AIEngine] {provider} error: {e}")
-                errtxt = str(e).lower()
-                # urllib.error.HTTPError (used by the OpenRouter client) is an OSError
-                # subclass but represents a normal HTTP status (401/429/etc), not a
-                # connectivity failure — don't treat it as one.
-                is_openrouter_http_status = self._use_openrouter and hasattr(e, "code") and isinstance(getattr(e, "code", None), int)
-                if not self._use_local_ai and not is_openrouter_http_status and (
-                        isinstance(e, (OSError, ConnectionError, TimeoutError))
-                        or "connection" in errtxt or "network" in errtxt):
-                    self._show_error_gif = True
-                    return {"command": "show_error_gif", "path": getattr(self, "_error_gif_path", ""), "segments": [], "shutdown": False}
-                if self._use_local_ai:
-                    try:
-                        local_model = self._config.get("LOCAL_AI_MODEL", "").strip()
-                        resp = self._client.chat.completions.create(
-                            model=local_model,
-                            messages=[{"role": "system", "content": system}] + messages,
-                            temperature=0.85, max_tokens=380, top_p=0.95,
-                            timeout=int(self._config.get("LOCAL_AI_TIMEOUT", TIMEOUT)), stream=False,
-                        )
-                        raw = resp.choices[0].message.content.strip() if hasattr(resp.choices[0], "message") else ""
-                        result = self._parse(raw)
-                        if is_user and result["command"] == "idle":
-                            import random
-                            result.update(command="speak", mood="neutral", segments=random.choice(_IDLE_FALLBACKS))
-                        self._record(user_turn, raw)
-                        return result
-                    except Exception:
-                        pass
-                    return {"command": "idle", "mood": "neutral", "segments": [], "shutdown": False}
-                if self._use_openrouter:
-                    # EXPERIMENTAL / single key: no rotation available — try once more
-                    # without streaming, then fall back to idle.
-                    try:
-                        resp = self._client.chat.completions.create(
-                            model=self._openrouter_model,
-                            messages=[{"role": "system", "content": system}] + messages,
-                            temperature=0.85, max_tokens=380, top_p=0.95,
-                            timeout=TIMEOUT, stream=False,
-                        )
-                        raw = resp.choices[0].message.content.strip() if hasattr(resp.choices[0], "message") else ""
-                        result = self._parse(raw)
-                        if is_user and result["command"] == "idle":
-                            import random
-                            result.update(command="speak", mood="neutral", segments=random.choice(_IDLE_FALLBACKS))
-                        self._record(user_turn, raw)
-                        return result
-                    except Exception:
-                        pass
-                    return {"command": "idle", "mood": "neutral", "segments": [], "shutdown": False}
-                if not self._rotate_key():
-                    self._groq_exhausted = True
-                    return {"command": "idle", "mood": "neutral", "segments": [], "shutdown": False, "groq_exhausted": True}
+        except Exception as e:
+            print(f"[AIEngine] LLM error: {e}")
+            errtxt = str(e).lower()
+            if (isinstance(e, (OSError, ConnectionError, TimeoutError))
+                    or "connection" in errtxt or "network" in errtxt):
+                self._show_error_gif = True
+                return {"command": "show_error_gif", "path": getattr(self, "_error_gif_path", ""), "segments": [], "shutdown": False}
+            return {"command": "idle", "mood": "neutral", "segments": [], "shutdown": False}
 
     # ── JSON parser ────────────────────────────────────────────────────────────
 
