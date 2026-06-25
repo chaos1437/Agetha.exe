@@ -1164,17 +1164,11 @@ class CompanionApp:
             self._placeholder_lbl.place(relx=0, rely=0, relwidth=1, relheight=1)
 
     def _get_placeholder_text(self):
-        """Build the placeholder string from current key/token status."""
+        """Build the placeholder string from current provider info."""
         try:
             status = self._ai.get_token_status()
-            if not status.get("using_groq"):
-                if status.get("provider") == "openrouter":
-                    return "OpenRouter (experimental)  •  type here..."
-                return "local AI  •  type here..."
-            idx   = status.get("key_index", 1)
-            total = status.get("key_count", 1)
-            pct   = status.get("pct_left", 100)
-            return f"key {idx}/{total}  \u2022  {pct}% tokens left"
+            provider = status.get("provider", "openai-compatible")
+            return f"{provider}  •  type here..."
         except Exception:
             return "type here..."
 
@@ -1657,17 +1651,15 @@ class CompanionApp:
             self._talking_rotate_job = None
 
     def _update_token_status(self):
-        """Update status bar with Groq token usage info."""
+        """Update status bar with provider info."""
         try:
             if not self._ai:
                 return
             status = self._ai.get_token_status()
-            if status.get("using_groq"):
-                key_info = f"Key {status['key_index']}/{status['key_count']}"
-                pct = status.get("pct_left", 0)
-                self._status_var.set(f"{key_info} | {pct}% left")
+            provider = status.get("provider", "")
+            if provider:
+                self._status_var.set(f"Using: {provider}")
             else:
-                # Local AI or no Groq
                 self._status_var.set("")
         except Exception as e:
             print(f"[Token Status] Error: {e}")
@@ -1971,8 +1963,8 @@ class CompanionApp:
         except Exception as exc:
             err_str = str(exc)
             print(f"[AI_TICK] Unhandled exception: {err_str}")
-            _groq_limit_keywords = ("rate_limit", "rate limit", "429", "quota", "groq_exhausted")
-            is_groq_limit = any(kw in err_str.lower() for kw in _groq_limit_keywords)
+            _rate_limit_keywords = ("rate_limit", "rate limit", "429", "quota")
+            is_rate_limit = any(kw in err_str.lower() for kw in _rate_limit_keywords)
             _connection_keywords = ("connection", "network", "timeout", "unreachable", "eoferror", "ssl")
             is_connection_error = any(kw in err_str.lower() for kw in _connection_keywords)
             if is_connection_error:
@@ -1996,7 +1988,7 @@ class CompanionApp:
                 self.root.after(0, _show_err_gif)
                 self.root.after(0, self._re_enable_input)
                 return
-            if not is_groq_limit:
+            if not is_rate_limit:
                 _short = err_str[:200]
                 native_error_popup("Agetha — Error", f"An error occurred:\n{_short}")
             self.root.after(0, self._re_enable_input)
@@ -2025,14 +2017,6 @@ class CompanionApp:
         segments          = response.get("segments", [])
         popup_msgs        = response.get("popup", None)
         shutdown_requested = bool(response.get("shutdown", False))
-        persistent_loaf   = bool(response.get("_persistent_loaf", False))
-
-        if response.get("groq_exhausted"):
-            self.root.after(0, lambda: self._subtitle.show_message(
-                "You reached your limit with your Groq keys", "#ff4444"))
-            self.root.after(0, lambda: self._set_state(self.STATE_IDLE))
-            self._reschedule_screen_poll()
-            return
 
         def _speak_and_continue(resp_segments, resp_mood, resp_shutdown):
             if resp_segments:
@@ -2432,19 +2416,12 @@ class CompanionApp:
         else:
             self._persistent_mood = None
             self.root.after(0, lambda: self._set_state(self.STATE_IDLE, mood))
-            if persistent_loaf:
-                # Stay in loaf — enter it immediately and don't reschedule poll
-                self.root.after(100, self._enter_loaf_persistent)
-            else:
-                self._reschedule_screen_poll()
+            self._reschedule_screen_poll()
 
     def _on_speech_done(self, shutdown: bool = False):
-        # AI spoke — exit loaf state and reset consecutive idle counter
+        # AI spoke — exit loaf state
         if getattr(self, "_is_loafing", False):
             self._is_loafing = False
-        if self._ai:
-            try: self._ai._consecutive_idle_count = 0
-            except Exception: pass
         self.root.after(0, lambda: self._set_state(self.STATE_IDLE))
         if shutdown:
             self.root.after(50, self._shutdown)
@@ -2501,37 +2478,15 @@ def _early_config_check():
 
     default_config = """# Agetha v5.0.1 config — @tomiszivacs on TikTok
 
-# Set to "yes" to use Ollama instead of Groq.
-USE_LOCAL_AI = no
+# LLM API settings (OpenAI-compatible)
+LLM_API_KEY = 
+LLM_BASE_URL = https://api.openai.com/v1
+LLM_MODEL = gpt-4o-mini
 
 # Set to "yes" to use local Whisper (faster-whisper) for voice input instead of Google STT.
 # Much faster — no internet needed. Requires: pip install faster-whisper numpy
 # Downloads a small ~75 MB model (tiny.en) on first run.
 USE_LOCAL_STT = yes
-
-# Groq API keys (use separate accounts to avoid rate limits)
-GROQ_API_KEY = 
-GROQ_API_KEY_2 = 
-GROQ_API_KEY_3 = 
-GROQ_API_KEY_4 = 
-GROQ_API_KEY_5 = 
-GROQ_API_KEY_6 = 
-GROQ_API_KEY_7 = 
-GROQ_API_KEY_8 = 
-GROQ_API_KEY_9 = 
-GROQ_API_KEY_10 = 
-GROQ_MODEL = llama-3.3-70b-versatile
-
-# EXPERIMENTAL: OpenRouter support.
-# If enabled, OpenRouter is used and Groq is bypassed entirely.
-# (The default model is kind of stupid, so you may want to change it to something else.)
-ENABLE_OPENROUTER = no
-OPENROUTER_API_KEY = 
-OPENROUTER_MODEL = nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free
-
-# Ollama / local model
-LOCAL_AI_MODEL = 
-LOCAL_AI_TIMEOUT = 30
 
 # Allow Agetha to run commands on your machine?
 ENABLE_COMMAND_EXECUTION = yes
