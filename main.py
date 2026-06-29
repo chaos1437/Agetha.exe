@@ -918,6 +918,7 @@ class CompanionApp:
     _BOUNCE_INTERVAL = 20
 
     def __init__(self):
+        self._ai_tick_lock = threading.Lock()
         try:
             import ctypes
             _shcore = ctypes.windll.shcore
@@ -1387,7 +1388,7 @@ class CompanionApp:
 
     def _show_angry_glitch_screenshot(self):
         """Take a screenshot, apply pixel glitch distortion, show fullscreen for 0.5s. 30% chance."""
-        if random.random() > 1:
+        if random.random() > 0.7:
             return
         def _do_glitch():
             try:
@@ -1936,75 +1937,79 @@ class CompanionApp:
     # ── AI tick ────────────────────────────────────────────────────────────────
 
     def _ai_tick(self, user_message: str | None = None):
-        is_user = user_message is not None
-        self.root.after(0, lambda: self._input_box.config(state="disabled"))
-
-        screen_text = ""
-        if not is_user:
-            # Randomly wander to a new position on some ambient polls (~25% of the time)
-            if random.random() < 0.25 and self._state == self.STATE_IDLE:
-                self.root.after(0, self._slide_to_random_position)
-            screen_text = self._screen.capture_text()
-            self._last_screen_text = screen_text
-
-        if is_user:
-            self.root.after(0, lambda: self._set_state(self.STATE_THINKING))
-
-        def _on_token(raw_so_far: str):
-            if is_user:
-                self._subtitle.show_thinking(raw_so_far)
-
-        try:
-            response = self._ai.query_streaming(
-                screen_context=screen_text if not is_user else self._last_screen_text,
-                user_message=user_message or "",
-                on_token=_on_token,
-            )
-        except Exception as exc:
-            err_str = str(exc)
-            print(f"[AI_TICK] Unhandled exception: {err_str}")
-            _rate_limit_keywords = ("rate_limit", "rate limit", "429", "quota")
-            is_rate_limit = any(kw in err_str.lower() for kw in _rate_limit_keywords)
-            _connection_keywords = ("connection", "network", "timeout", "unreachable", "eoferror", "ssl")
-            is_connection_error = any(kw in err_str.lower() for kw in _connection_keywords)
-            if is_connection_error:
-                # Connection error → show error.gif permanently
-                def _show_err_gif():
-                    path = str(ASSETS / "error.gif")
-                    try:
-                        from PIL import Image as _Img, ImageSequence as _IS
-                        from pathlib import Path as _Path
-                        gif_path = _Path(path)
-                        if not gif_path.exists():
-                            return
-                        player = GifPlayer(self._gif_label, path, self.root.after)
-                        if self._current_gif_player:
-                            self._current_gif_player.stop()
-                        self._current_gif_player = player
-                        player.play()
-                        self._status_var.set("connection error")
-                    except Exception as eg:
-                        print(f"[ERROR_GIF] {eg}")
-                self.root.after(0, _show_err_gif)
-                self.root.after(0, self._re_enable_input)
-                return
-            if not is_rate_limit:
-                _short = err_str[:200]
-                native_error_popup("Agetha — Error", f"An error occurred:\n{_short}")
-            self.root.after(0, self._re_enable_input)
-            self.root.after(0, lambda: self._set_state(self.STATE_IDLE))
-            self._reschedule_screen_poll()
+        if not self._ai_tick_lock.acquire(blocking=False):
+            print("[AI_TICK] already running — skipping")
             return
+        try:
+            is_user = user_message is not None
+            self.root.after(0, lambda: self._input_box.config(state="disabled"))
 
-        print("\n" + "─" * 52)
-        if user_message and user_message != "__touch__":
-            print(f"[USER]  {user_message}")
-        print(f"[AI]    {json.dumps(response, ensure_ascii=False)}")
-        print("─" * 52)
+            screen_text = ""
+            if not is_user:
+                if random.random() < 0.25 and self._state == self.STATE_IDLE:
+                    self.root.after(0, self._slide_to_random_position)
+                screen_text = self._screen.capture_text()
+                self._last_screen_text = screen_text
 
-        self.root.after(0, self._re_enable_input)
-        self.root.after(0, self._update_token_status)
-        self._dispatch_response(response, user_message)
+            if is_user:
+                self.root.after(0, lambda: self._set_state(self.STATE_THINKING))
+
+            def _on_token(raw_so_far: str):
+                if is_user:
+                    self._subtitle.show_thinking(raw_so_far)
+
+            try:
+                response = self._ai.query_streaming(
+                    screen_context=screen_text if not is_user else self._last_screen_text,
+                    user_message=user_message or "",
+                    on_token=_on_token,
+                )
+            except Exception as exc:
+                err_str = str(exc)
+                print(f"[AI_TICK] Unhandled exception: {err_str}")
+                _rate_limit_keywords = ("rate_limit", "rate limit", "429", "quota")
+                is_rate_limit = any(kw in err_str.lower() for kw in _rate_limit_keywords)
+                _connection_keywords = ("connection", "network", "timeout", "unreachable", "eoferror", "ssl")
+                is_connection_error = any(kw in err_str.lower() for kw in _connection_keywords)
+                if is_connection_error:
+                    def _show_err_gif():
+                        path = str(ASSETS / "error.gif")
+                        try:
+                            from PIL import Image as _Img, ImageSequence as _IS
+                            from pathlib import Path as _Path
+                            gif_path = _Path(path)
+                            if not gif_path.exists():
+                                return
+                            player = GifPlayer(self._gif_label, path, self.root.after)
+                            if self._current_gif_player:
+                                self._current_gif_player.stop()
+                            self._current_gif_player = player
+                            player.play()
+                            self._status_var.set("connection error")
+                        except Exception as eg:
+                            print(f"[ERROR_GIF] {eg}")
+                    self.root.after(0, _show_err_gif)
+                    self.root.after(0, self._re_enable_input)
+                    return
+                if not is_rate_limit:
+                    _short = err_str[:200]
+                    native_error_popup("Agetha — Error", f"An error occurred:\n{_short}")
+                self.root.after(0, self._re_enable_input)
+                self.root.after(0, lambda: self._set_state(self.STATE_IDLE))
+                self._reschedule_screen_poll()
+                return
+
+            print("\n" + "─" * 52)
+            if user_message and user_message != "__touch__":
+                print(f"[USER]  {user_message}")
+            print(f"[AI]    {json.dumps(response, ensure_ascii=False)}")
+            print("─" * 52)
+
+            self.root.after(0, self._re_enable_input)
+            self.root.after(0, self._update_token_status)
+            self._dispatch_response(response, user_message)
+        finally:
+            self._ai_tick_lock.release()
 
     # ── Response dispatcher ────────────────────────────────────────────────────
 
@@ -2154,10 +2159,13 @@ class CompanionApp:
 
         # ── create_folder ──
         if command == "create_folder":
-            path = response.get("path","").strip()
-            if path:
-                try: os.makedirs(path, exist_ok=True); print(f"[FS] Created folder: {path}")
-                except Exception as e: print(f"[FS] Failed to create folder {path}: {e}")
+            raw_path = response.get("path","").strip()
+            safe = self._validate_path(raw_path) if raw_path else None
+            if safe:
+                try: os.makedirs(safe, exist_ok=True); print(f"[FS] Created folder: {safe}")
+                except Exception as e: print(f"[FS] Failed to create folder {safe}: {e}")
+            else:
+                print(f"[FS] Blocked folder creation: {raw_path}")
             _speak_and_continue(segments, mood, shutdown_requested)
             return
 
@@ -2169,54 +2177,67 @@ class CompanionApp:
                 file_name = response.get("file_name","").strip()
                 if path and file_name: file_path = os.path.join(path, file_name)
             content = response.get("content","")
-            if file_path:
+            safe = self._validate_path(file_path) if file_path else None
+            if safe:
                 try:
-                    parent = os.path.dirname(file_path)
+                    parent = os.path.dirname(safe)
                     if parent: os.makedirs(parent, exist_ok=True)
-                    with open(file_path, "w", encoding="utf-8") as f: f.write(content)
-                    print(f"[FS] Created file: {file_path}")
+                    with open(safe, "w", encoding="utf-8") as f: f.write(content)
+                    print(f"[FS] Created file: {safe}")
                 except Exception as e:
-                    print(f"[FS] Failed to create file {file_path}: {e}")
+                    print(f"[FS] Failed to create file {safe}: {e}")
+            else:
+                print(f"[FS] Blocked file creation: {file_path}")
             _speak_and_continue(segments, mood, shutdown_requested)
             return
 
         # ── delete_file ──
         if command == "delete_file":
-            path = response.get("path","").strip()
-            if path:
+            raw_path = response.get("path","").strip()
+            safe = self._validate_path(raw_path) if raw_path else None
+            if safe:
                 import shutil
                 try:
-                    p = Path(path)
-                    if p.is_dir(): shutil.rmtree(p); print(f"[FS] Deleted folder: {path}")
-                    elif p.exists(): p.unlink(); print(f"[FS] Deleted file: {path}")
-                except Exception as e: print(f"[FS] Failed to delete {path}: {e}")
+                    p = Path(safe)
+                    if p.is_dir(): shutil.rmtree(p); print(f"[FS] Deleted folder: {safe}")
+                    elif p.exists(): p.unlink(); print(f"[FS] Deleted file: {safe}")
+                except Exception as e: print(f"[FS] Failed to delete {safe}: {e}")
+            else:
+                print(f"[FS] Blocked deletion: {raw_path}")
             _speak_and_continue(segments, mood, shutdown_requested)
             return
 
         # ── rename_file ──
         if command == "rename_file":
-            path = response.get("path","").strip()
+            raw_path = response.get("path","").strip()
             new_name = response.get("new_name","").strip()
-            if path and new_name:
+            safe = self._validate_path(raw_path) if raw_path else None
+            if safe and new_name:
                 try:
-                    p = Path(path); p.rename(p.parent / new_name); print(f"[FS] Renamed: {path}")
-                except Exception as e: print(f"[FS] Failed to rename {path}: {e}")
+                    p = Path(safe); p.rename(p.parent / new_name); print(f"[FS] Renamed: {safe}")
+                except Exception as e: print(f"[FS] Failed to rename {safe}: {e}")
+            else:
+                print(f"[FS] Blocked rename: {raw_path}")
             _speak_and_continue(segments, mood, shutdown_requested)
             return
 
         # ── list_dir ──
         if command in ("list_dir", "list_directory"):
-            req_path = response.get("path","").strip() or str(self._ai._system_path)
-            try:
-                p = Path(req_path)
-                if not p.exists(): lines = [f"[not found: {req_path}]"]
-                elif not p.is_dir(): lines = [f"[not a directory: {req_path}]"]
-                else:
-                    entries = sorted(p.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
-                    lines = [e.name + ("/" if e.is_dir() else "") for e in entries] or ["[empty directory]"]
-            except Exception as e: lines = [f"[error listing: {e}]"]
+            raw_path = response.get("path","").strip() or str(self._ai._system_path)
+            safe = self._validate_path(raw_path) if raw_path else None
+            if safe:
+                try:
+                    p = Path(safe)
+                    if not p.exists(): lines = [f"[not found: {safe}]"]
+                    elif not p.is_dir(): lines = [f"[not a directory: {safe}]"]
+                    else:
+                        entries = sorted(p.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
+                        lines = [e.name + ("/" if e.is_dir() else "") for e in entries] or ["[empty directory]"]
+                except Exception as e: lines = [f"[error listing: {e}]"]
+            else:
+                lines = [f"[blocked: {raw_path}]"]
             self.root.after(0, lambda: AgethaPopup(self.root, lines[:12], mood))
-            if not segments: segments = [{"text": f"{len(lines)} items in {req_path}", "pause": 0.0}]
+            if not segments: segments = [{"text": f"{len(lines)} items", "pause": 0.0}]
             _speak_and_continue(segments, mood, shutdown_requested)
             return
 
@@ -2246,8 +2267,11 @@ class CompanionApp:
 
         # ── take_screenshot ──
         if command == "take_screenshot":
-            save_path = response.get("save_path","").strip()
-            if not save_path:
+            raw_path = response.get("save_path","").strip()
+            if raw_path:
+                safe = self._validate_path(raw_path)
+                save_path = safe if safe else os.path.join(self._ai._system_path, "screenshot.png")
+            else:
                 import datetime as _dt
                 ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
                 save_path = os.path.join(self._ai._system_path, f"screenshot_{ts}.png")
@@ -2271,11 +2295,14 @@ class CompanionApp:
                     elif _sys == "Linux":
                         _sp.Popen(["notify-send", title, message])
                     elif _sys == "Windows":
+                        # Escape double quotes for PowerShell
+                        _safe_title = title.replace('"', '`"')
+                        _safe_msg = message.replace('"', '`"')
                         ps = (f'[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, '
                               f'ContentType = WindowsRuntime] > $null;$t = [Windows.UI.Notifications.ToastTemplateType]::ToastText02;'
                               f'$x = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent($t);'
-                              f'$x.GetElementsByTagName("text")[0].AppendChild($x.CreateTextNode("{title}"));'
-                              f'$x.GetElementsByTagName("text")[1].AppendChild($x.CreateTextNode("{message}"));'
+                              f'$x.GetElementsByTagName("text")[0].AppendChild($x.CreateTextNode("{_safe_title}"));'
+                              f'$x.GetElementsByTagName("text")[1].AppendChild($x.CreateTextNode("{_safe_msg}"));'
                               f'$n = [Windows.UI.Notifications.ToastNotification]::new($x);'
                               f'[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("Agetha").Show($n);')
                         _sp.Popen(["powershell", "-Command", ps], shell=False)
@@ -2294,29 +2321,15 @@ class CompanionApp:
                 self.root.after(2200, self._reschedule_screen_poll)
             return
 
-        # ── run_command ──
-        if command == "run_command":
-            cmd_str = response.get("cmd","").strip()
-            use_shell = bool(response.get("shell", True))
-            if cmd_str:
-                try:
-                    import subprocess as _sp
-                    result_proc = _sp.run(cmd_str, shell=use_shell, capture_output=True,
-                                          text=True, timeout=15)
-                    out = (result_proc.stdout or "").strip()
-                    err = (result_proc.stderr or "").strip()
-                    print(f"[CMD] Ran: {cmd_str}")
-                    if out: print(f"[CMD] stdout: {out[:200]}")
-                    if err: print(f"[CMD] stderr: {err[:200]}")
-                except Exception as e: print(f"[CMD] Failed to run '{cmd_str}': {e}")
-            _speak_and_continue(segments, mood, shutdown_requested)
-            return
-
         # ── read_document ──
         if command == "read_document":
             doc_path = response.get("path","").strip()
-            doc_content = self._ai.read_document(doc_path) if doc_path else "[no path provided]"
-            print(f"[DOC] Read '{doc_path}': {doc_content[:80]}")
+            if doc_path and not self._validate_path(doc_path):
+                print(f"[DOC] Blocked read: {doc_path}")
+                doc_content = "[blocked]"
+            else:
+                doc_content = self._ai.read_document(doc_path) if doc_path else "[no path provided]"
+                print(f"[DOC] Read '{doc_path}': {doc_content[:80]}")
             def _requery_with_doc():
                 self.root.after(0, lambda: self._set_state(self.STATE_THINKING))
                 def _on_token(raw_so_far: str): self._subtitle.show_thinking(raw_so_far)
@@ -2417,6 +2430,44 @@ class CompanionApp:
             self._persistent_mood = None
             self.root.after(0, lambda: self._set_state(self.STATE_IDLE, mood))
             self._reschedule_screen_poll()
+
+    @staticmethod
+    def _validate_path(path_str: str) -> str | None:
+        """Resolve path and reject if it escapes user home or is a system path."""
+        if not path_str or not path_str.strip():
+            return None
+        try:
+            p = Path(path_str).resolve()
+            # Reject paths that try to escape via symlinks or ..
+            if not p.exists():
+                # for non-existing, check the longest existing parent
+                parent = p
+                while not parent.exists() and parent.parent != parent:
+                    parent = parent.parent
+            else:
+                parent = p
+
+            # Block access to sensitive system directories
+            sensitive_prefixes = [
+                "/etc", "/sys", "/proc", "/dev", "/boot", "/root",
+                "/var/log", "/var/lib", "/run",
+            ]
+            for prefix in sensitive_prefixes:
+                if str(p).startswith(prefix):
+                    print(f"[FS] Blocked access to system path: {p}")
+                    return None
+
+            # On Windows, block system directories
+            if platform.system() == "Windows":
+                sys_root = os.environ.get("SystemRoot", "C:\\Windows").lower()
+                if str(p).lower().startswith(sys_root):
+                    print(f"[FS] Blocked access to system path: {p}")
+                    return None
+
+            return str(p)
+        except Exception as e:
+            print(f"[FS] Path validation error: {e}")
+            return None
 
     def _on_speech_done(self, shutdown: bool = False):
         # AI spoke — exit loaf state
