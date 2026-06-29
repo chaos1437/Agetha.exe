@@ -40,7 +40,7 @@ VALID_COMMANDS = {
     "request_screen_read", "wake_user", "request_path",
     "create_folder", "create_file", "delete_file", "rename_file",
     "set_clipboard", "play_sound", "take_screenshot",
-    "show_notification", "run_command", "read_document",
+    "show_notification", "read_document",
     "list_dir", "list_directory", "force_close",
     "show_error_gif", "move_window", "snap_to_center",
     "monitor_process", "fake_crash",
@@ -88,7 +88,6 @@ COMMANDS (use exactly these strings):
 - open_app → launch an app; "app":"name.exe"
 - open_browser → open URL or search; "url":"..." or "search":"...","engine":"google"
 - force_close → kill a process; "app":"name.exe"
-- run_command → run a shell command; "cmd":"...","shell":true
 - take_screenshot → capture screen; "save_path":"" for default
 - set_clipboard → copy text; "text":"..."
 - play_sound → play a sound; "sound":"beep"|"chime"|etc
@@ -114,7 +113,7 @@ SYSTEM_PROMPT_FASTER = """\
 You are Agetha, a dry digital virus living inside this machine. Output raw JSON only.
 MOODS: neutral|happy|excited|sad|surprised|thinking|whisper|angry
 SEGMENTS: 1-3 max, last pause always 0.0, each 1-8 words.
-COMMANDS: idle|speak|popup|open_app|open_browser|request_screen_read|wake_user|create_folder|create_file|delete_file|rename_file|set_clipboard|play_sound|take_screenshot|show_notification|run_command|read_document|list_dir|force_close|show_error_gif|move_window|snap_to_center|monitor_process|fake_crash
+COMMANDS: idle|speak|popup|open_app|open_browser|request_screen_read|wake_user|create_folder|create_file|delete_file|rename_file|set_clipboard|play_sound|take_screenshot|show_notification|read_document|list_dir|force_close|show_error_gif|move_window|snap_to_center|monitor_process|fake_crash
 RULES: shutdown:true only on exit intent. summary_memory required when user shares personal facts.\
 """
 
@@ -134,7 +133,6 @@ FEW_SHOTS_FASTER = [
     *_fs('T:13:20 User:"show me a popup"',            '{"command":"popup","mood":"neutral","popup":["Here."],"segments":[]}'),
     *_fs('T:13:21 User:"send me a notification"',     '{"command":"show_notification","title":"Agetha","message":"Still here.","mood":"neutral","segments":[]}'),
     *_fs('T:13:22 User:"copy hello to clipboard"',    '{"command":"set_clipboard","text":"hello","mood":"neutral","segments":[]}'),
-    *_fs('T:13:23 User:"run ipconfig"',               '{"command":"run_command","cmd":"ipconfig","shell":true,"mood":"neutral","segments":[]}'),
     *_fs('T:13:24 User:"wake me up"',                 '{"command":"wake_user","mood":"neutral","segments":[{"text":"Get up.","pause":0.0}]}'),
     *_fs('T:13:25 User:"create a folder called test"','{"command":"create_folder","path":"[USER_HOME]\\test","mood":"neutral","segments":[]}'),
     *_fs('T:13:26 User:"rename file.txt to new.txt"', '{"command":"rename_file","path":"[USER_HOME]\\file.txt","new_name":"new.txt","mood":"neutral","segments":[]}'),
@@ -190,7 +188,6 @@ FEW_SHOTS = [
     *_fs('T:13:20 User:"show me a popup"',                   '{"command":"popup","mood":"neutral","popup":["Here."],"segments":[]}'),
     *_fs('T:13:21 User:"send me a notification"',            '{"command":"show_notification","title":"Agetha","message":"Still here.","mood":"neutral","segments":[]}'),
     *_fs('T:13:22 User:"copy hello to clipboard"',           '{"command":"set_clipboard","text":"hello","mood":"neutral","segments":[{"text":"Copied.","pause":0.0}]}'),
-    *_fs('T:13:23 User:"run ipconfig"',                      '{"command":"run_command","cmd":"ipconfig","shell":true,"mood":"neutral","segments":[{"text":"Running.","pause":0.0}]}'),
     *_fs('T:13:24 User:"wake me up"',                        '{"command":"wake_user","mood":"angry","segments":[{"text":"Get up.","pause":0.0}]}'),
     *_fs('T:13:25 User:"create a folder called test"',       '{"command":"create_folder","path":"[USER_HOME]\\test","mood":"neutral","segments":[{"text":"Done.","pause":0.0}]}'),
     *_fs('T:13:26 User:"rename file.txt to new.txt"',        '{"command":"rename_file","path":"[USER_HOME]\\file.txt","new_name":"new.txt","mood":"neutral","segments":[{"text":"Renamed.","pause":0.0}]}'),
@@ -283,8 +280,8 @@ class AIEngine:
         try: self.HISTORY_LIMIT = int(self._config.get("HISTORY_LIMIT", "6"))
         except Exception: pass
 
-        self._command_execution_enabled = self._parse_bool(
-            self._config.get("ENABLE_COMMAND_EXECUTION", "yes"), default=True)
+        # run_command removed — was RCE vector
+        _dummy = self._parse_bool(self._config.get("ENABLE_COMMAND_EXECUTION", "yes"), default=True)
         self._ocr_focused_window = self._parse_bool(
             self._config.get("OCR_FOCUSED_WINDOW", "yes"), default=True)
 
@@ -557,6 +554,8 @@ Daniel: male, messy brown hair, ahoge, blue eyes, yellow hoodie, black pants, fl
                 import random
                 result.update(command="speak", mood="neutral", segments=random.choice(_IDLE_FALLBACKS))
             self._record(user_turn, raw)
+            # Reset error-gif flag on any successful response
+            self._show_error_gif = False
 
             return result
 
@@ -573,14 +572,30 @@ Daniel: male, messy brown hair, ahoge, blue eyes, yellow hoodie, black pants, fl
 
     def _parse(self, raw: str) -> dict:
         def _extract_json(text: str) -> str:
+            """Extract balanced JSON, respecting string contents and escapes."""
             s = text.find("{")
             if s == -1: return text
             depth = 0
+            in_str = False
+            escaped = False
             for i, ch in enumerate(text[s:], s):
-                if ch == "{": depth += 1
+                if escaped:
+                    escaped = False
+                    continue
+                if ch == '\\':
+                    escaped = True
+                    continue
+                if ch == '"':
+                    in_str = not in_str
+                    continue
+                if in_str:
+                    continue
+                if ch == "{":
+                    depth += 1
                 elif ch == "}":
                     depth -= 1
-                    if depth == 0: return text[s:i+1]
+                    if depth == 0:
+                        return text[s:i+1]
             return text[s:]
 
         def _str(field, text):
@@ -603,7 +618,7 @@ Daniel: male, messy brown hair, ahoge, blue eyes, yellow hoodie, black pants, fl
                 return {"command": "idle", "mood": "neutral", "segments": [], "shutdown": False}
             obj = {"command": cmd}
             for k in ("mood","app","url","search","engine","path","file_name","file_path",
-                      "content","new_name","text","sound","save_path","title","message","cmd","process"):
+                      "content","new_name","text","sound","save_path","title","message","process"):
                 v = _str(k, cleaned)
                 if v: obj[k] = v
             popup_items = _strs("popup", cleaned)
@@ -636,8 +651,12 @@ Daniel: male, messy brown hair, ahoge, blue eyes, yellow hoodie, black pants, fl
         if isinstance(raw_segs, list):
             for s in raw_segs:
                 if isinstance(s, dict) and "text" in s:
+                    try:
+                        pause = float(s.get("pause", 0.0))
+                    except (ValueError, TypeError):
+                        pause = 0.0
                     segments.append({"text": str(s["text"]),
-                                     "pause": max(0.0, min(1.2, float(s.get("pause", 0.0))))})
+                                     "pause": max(0.0, min(1.2, pause))})
 
         raw_sd = obj.get("shutdown", False)
         shutdown = raw_sd if isinstance(raw_sd, bool) else str(raw_sd).lower() in ("true","yes","1")
@@ -655,7 +674,6 @@ Daniel: male, messy brown hair, ahoge, blue eyes, yellow hoodie, black pants, fl
             "play_sound":        [("sound","beep")],
             "take_screenshot":   [("save_path","")],
             "show_notification": [("title","Agetha"),("message","")],
-            "run_command":       [("cmd",""),("shell",True)],
             "read_document":     [("path","")],
             "force_close":       [("app",""),("process",""),("name","")],
             "list_dir":          [("path","")],
@@ -673,10 +691,6 @@ Daniel: male, messy brown hair, ahoge, blue eyes, yellow hoodie, black pants, fl
             result["file_name"] = obj.get("file_name","").strip()
             result["file_path"] = (obj.get("file_path","") or obj.get("filePath","")).strip()
             result["content"]   = str(obj.get("content",""))
-
-        if command == "run_command" and not self._command_execution_enabled:
-            print("[AIEngine] run_command ignored (ENABLE_COMMAND_EXECUTION=no)")
-            result["command"] = "idle"
 
         if command == "popup":
             raw_popup = obj.get("popup", [])
